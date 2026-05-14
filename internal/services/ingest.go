@@ -13,10 +13,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/Trustless-Work/Indexer/internal/detector"
 	"github.com/Trustless-Work/Indexer/internal/errs"
+	"github.com/Trustless-Work/Indexer/internal/health"
 	"github.com/Trustless-Work/Indexer/internal/metrics"
 	"github.com/Trustless-Work/Indexer/internal/publisher"
 	indexerrpc "github.com/Trustless-Work/Indexer/internal/rpc"
@@ -101,6 +103,14 @@ type ingestService struct {
 	stateStore        state.Store
 	watchlist         *state.Watchlist
 	strictMode        bool
+
+	// lastState is an atomic pointer to the most recently persisted
+	// State. It is updated on the loop goroutine after each successful
+	// Save and read (wait-free) by the health server's /status
+	// handler. Using atomic.Pointer over a mutex keeps the hot path
+	// lock-free while still providing the memory barrier required for
+	// other goroutines to observe the update.
+	lastState atomic.Pointer[state.State]
 }
 
 // NewIngestService validates cfg and constructs the orchestrator. It
@@ -158,6 +168,10 @@ func (s *ingestService) Run(ctx context.Context, startLedger, endLedger uint32, 
 	}
 
 	current := initial
+	// Publish the initial state so /status returns something meaningful
+	// even before the first ledger is processed.
+	s.publishSnapshot(current)
+
 	currentLedger := startLedger
 	log.Ctx(ctx).Infof("Starting ingestion loop from ledger %d (end=%d)", startLedger, endLedger)
 
@@ -193,6 +207,11 @@ func (s *ingestService) Run(ctx context.Context, startLedger, endLedger uint32, 
 		}
 
 		current = newState
+		// Publish the new state to observers (health/status) AFTER the
+		// save returns nil so /status never reports a cursor advance
+		// that didn't actually land on disk.
+		s.publishSnapshot(current)
+
 		metrics.SetCurrentLedger(s.networkName, currentLedger)
 		metrics.RecordLedgerProcessed(s.networkName, duration, metrics.StatusOK)
 		log.Ctx(ctx).Infof("Processed ledger %d in %.3fs", currentLedger, duration)
@@ -347,4 +366,32 @@ func (s *ingestService) prepareBackendRange(ctx context.Context, startLedger, en
 		return fmt.Errorf("preparing backend range from %d: %w", startLedger, err)
 	}
 	return nil
+}
+
+// publishSnapshot stores a defensive copy of s into the atomic pointer
+// observed by Snapshot(). Called by the loop after the state is durably
+// saved so /status never advertises progress that didn't land on disk.
+func (s *ingestService) publishSnapshot(st state.State) {
+	clone := st
+	s.lastState.Store(&clone)
+}
+
+// Snapshot returns a LiveSnapshot of the loop's current progress for
+// the /status handler. Safe for concurrent calls; uses atomic load and
+// reads the runtime watchlist size at call time.
+//
+// Before the first ledger is processed, Snapshot returns a zero-valued
+// LiveSnapshot (with the current watchlist size). This is the
+// expected "I just started" reading.
+func (s *ingestService) Snapshot() health.LiveSnapshot {
+	wlSize := s.watchlist.Size()
+	if p := s.lastState.Load(); p != nil {
+		return health.LiveSnapshot{
+			LastLedgerSeq:   p.LastLedgerSeq,
+			LastMessageID:   p.LastMessageID,
+			LastPublishedAt: p.LastPublishedAt,
+			WatchlistSize:   wlSize,
+		}
+	}
+	return health.LiveSnapshot{WatchlistSize: wlSize}
 }

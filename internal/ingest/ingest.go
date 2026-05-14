@@ -28,11 +28,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/Trustless-Work/Indexer/internal/config"
 	"github.com/Trustless-Work/Indexer/internal/detector"
 	"github.com/Trustless-Work/Indexer/internal/events"
+	"github.com/Trustless-Work/Indexer/internal/health"
 	"github.com/Trustless-Work/Indexer/internal/metrics"
 	"github.com/Trustless-Work/Indexer/internal/publisher"
 	"github.com/Trustless-Work/Indexer/internal/services"
@@ -42,6 +44,13 @@ import (
 	"github.com/Trustless-Work/Indexer/internal/utils"
 	"github.com/stellar/go-stellar-sdk/support/log"
 )
+
+// Version is the Indexer's reported version. Override at build time via
+//
+//	go build -ldflags "-X github.com/Trustless-Work/Indexer/internal/ingest.Version=v1.2.3"
+//
+// "dev" is the safe default for unstamped builds.
+var Version = "dev"
 
 // httpClientTimeout is the per-request timeout for the auxiliary HTTP
 // client used to call the RPC health endpoint at boot. Generous because
@@ -112,6 +121,25 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("constructing ingest service: %w", err)
 	}
 
+	// --- Health server --------------------------------------------
+	// Bound synchronously so port conflicts fail-fast at boot.
+	// Construction returns nil when HEALTH_ENABLED=false.
+	healthSrv, err := startHealthServer(ctx, cfg, svc, outSink)
+	if err != nil {
+		return err
+	}
+	var healthWG sync.WaitGroup
+	if healthSrv != nil {
+		healthWG.Add(1)
+		go func() {
+			defer healthWG.Done()
+			if err := healthSrv.Serve(ctx); err != nil {
+				log.Ctx(ctx).Errorf("health server: %v", err)
+			}
+		}()
+		defer healthWG.Wait()
+	}
+
 	log.Ctx(ctx).Infof("Ingest starting (network=%s, start=%d, end=%d, strict=%v)",
 		cfg.Network.Name, startLedger, cfg.Indexer.EndLedger, cfg.StrictMode)
 
@@ -119,6 +147,41 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("running ingest from %d to %d: %w", startLedger, cfg.Indexer.EndLedger, err)
 	}
 	return nil
+}
+
+// startHealthServer constructs and binds the health HTTP server. The
+// listener is opened synchronously so port conflicts surface as a boot
+// error rather than a goroutine warning. If HEALTH_ENABLED=false,
+// returns (nil, nil) — the caller skips the goroutine.
+//
+// The pinger plumbed into /readyz comes from the sink if it implements
+// HealthChecker; otherwise nil (the noop sink, for example, has no
+// failure mode worth probing — health.Server treats nil as always
+// ready, which is the right semantic for it).
+func startHealthServer(ctx context.Context, cfg *config.Config, snapper health.Snapshotter, outSink sinkpkg.Sink) (*health.Server, error) {
+	if !cfg.Health.Enabled {
+		log.Ctx(ctx).Info("HEALTH_ENABLED=false — skipping health server")
+		return nil, nil
+	}
+
+	var pinger health.Pinger
+	if hc, ok := outSink.(sinkpkg.HealthChecker); ok {
+		pinger = hc.Ping
+	}
+
+	addr := fmt.Sprintf(":%d", cfg.Health.Port)
+	srv, err := health.New(health.Config{
+		Addr:      addr,
+		Version:   Version,
+		Network:   cfg.Network.Name,
+		SinkType:  cfg.Sink.Type,
+		StartedAt: time.Now().UTC(),
+	}, snapper, pinger)
+	if err != nil {
+		return nil, fmt.Errorf("starting health server on %s: %w", addr, err)
+	}
+	log.Ctx(ctx).Infof("Health server listening on %s (/healthz /readyz /metrics /status)", srv.Addr())
+	return srv, nil
 }
 
 // loadOrInitState figures out the boot State and the ledger to start
