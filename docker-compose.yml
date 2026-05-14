@@ -1,0 +1,131 @@
+# Local development stack for the Indexer.
+#
+#   make up        # bring everything up
+#   make down      # stop everything (volumes preserved)
+#   make logs      # tail the Indexer
+#   make ps        # status of all services
+#
+# What this brings up:
+#
+#   rabbitmq        — broker with management UI on :15672 (admin/admin).
+#                     Listens on AMQP :5672. State persisted to a named
+#                     volume so messages survive `docker compose down`.
+#
+#   rabbitmq-init   — one-shot job that declares the indexer.events
+#                     queue + binding to stellar.events. Idempotent;
+#                     runs once after rabbitmq is healthy and exits.
+#                     Without this, messages the Indexer publishes are
+#                     dropped silently because no queue is bound.
+#
+#   indexer         — the binary, built from this repo. Publishes to
+#                     rabbitmq at the service hostname. State lives in
+#                     a named volume so cursor + watchlist survive
+#                     restarts.
+#
+# Notes:
+#   - Variables like ${RPC_URL:-...} read from your shell env if set,
+#     falling back to sane testnet defaults. You don't need a .env for
+#     compose — but if you have one, compose picks it up automatically.
+#   - The Indexer service forces SINK_TYPE=rabbitmq. The local .env
+#     (used by `make run`) can keep SINK_TYPE=noop; the two flows
+#     don't conflict because the docker indexer uses its own volume.
+#   - Port 8080 (Indexer health server) clashes with the local
+#     `make run`. Stop one before starting the other.
+
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: indexer-rabbitmq
+    hostname: rabbitmq
+    ports:
+      - "5672:5672"     # AMQP (binary protocol)
+      - "15672:15672"   # Management UI: http://localhost:15672
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-admin}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:-admin}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    restart: unless-stopped
+
+  # One-shot job: declare exchange + queue + binding so messages the
+  # Indexer publishes have somewhere to land. Exits 0 on success.
+  # The Indexer itself declares the exchange too (idempotent), so it
+  # would work without this — but the queue + binding are NOT
+  # declared by the Indexer (consumers normally own their queues),
+  # and without them every published message is dropped silently.
+  rabbitmq-init:
+    image: rabbitmq:3.13-management
+    container_name: indexer-rabbitmq-init
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_USER: ${RABBITMQ_USER:-admin}
+      RABBITMQ_PASS: ${RABBITMQ_PASS:-admin}
+      RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-stellar.events}
+      INDEXER_QUEUE: ${INDEXER_QUEUE:-indexer.events}
+      ROUTING_KEY: ${INDEXER_ROUTING_KEY:-stellar.#}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        RMQ="rabbitmqadmin --host=rabbitmq --port=15672 --username=$$RABBITMQ_USER --password=$$RABBITMQ_PASS"
+        echo "declaring exchange $$RABBITMQ_EXCHANGE..."
+        $$RMQ declare exchange name=$$RABBITMQ_EXCHANGE type=topic durable=true
+        echo "declaring queue $$INDEXER_QUEUE..."
+        $$RMQ declare queue name=$$INDEXER_QUEUE durable=true
+        echo "binding $$INDEXER_QUEUE to $$RABBITMQ_EXCHANGE with key $$ROUTING_KEY..."
+        $$RMQ declare binding source=$$RABBITMQ_EXCHANGE destination=$$INDEXER_QUEUE routing_key="$$ROUTING_KEY"
+        echo "rabbitmq topology ready"
+    restart: "no"
+
+  indexer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${VERSION:-dev}
+    container_name: indexer
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      rabbitmq-init:
+        condition: service_completed_successfully
+    environment:
+      # --- Network ---
+      RPC_URL: ${RPC_URL:-https://soroban-testnet.stellar.org}
+      NETWORK_NAME: ${NETWORK_NAME:-testnet}
+      NETWORK_PASSPHRASE: ${NETWORK_PASSPHRASE:-Test SDF Network ; September 2015}
+
+      # --- Sink: forced to rabbitmq when running under compose. ---
+      SINK_TYPE: rabbitmq
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-admin}:${RABBITMQ_PASS:-admin}@rabbitmq:5672/
+      RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-stellar.events}
+      RABBITMQ_PUBLISHER_CONFIRMS: "true"
+
+      # --- State / observability ---
+      STATE_PATH: /var/lib/indexer/state.json
+      HEALTH_ENABLED: "true"
+      HEALTH_PORT: "8080"
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      STRICT_MODE: ${STRICT_MODE:-true}
+
+      # --- Optional tunables ---
+      INDEXER_START_LEDGER: ${INDEXER_START_LEDGER:-0}
+      INDEXER_END_LEDGER: ${INDEXER_END_LEDGER:-0}
+    ports:
+      - "8080:8080"   # /healthz /readyz /metrics /status
+    volumes:
+      - indexer-state:/var/lib/indexer
+    restart: unless-stopped
+
+volumes:
+  rabbitmq-data:
+  indexer-state:

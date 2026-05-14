@@ -1,0 +1,33 @@
+# Keep the build context small.
+# Items here are NOT copied into the image. Mirrors .gitignore plus a
+# few build artifacts we never want inside the layer cache.
+
+# VCS / IDE
+.git
+.gitignore
+.idea
+.vscode
+.claude
+
+# Local environment + runtime state
+.env
+indexer.state.json
+indexer.state.json.lock
+indexer.state.json.tmp
+indexer.watchlist.seed.json
+
+# Build artifacts (rebuilt inside the image)
+bin/
+
+# Docker bits — not needed inside the image
+Dockerfile
+.dockerignore
+docker-compose*.yml
+docker/
+
+# Docs — useful in the repo, dead weight in a runtime image
+README.md
+CHANGELOG.md
+CONTRIBUTORS_GUIDELINE.md
+GIT_GUIDELINE.md
+docs/
