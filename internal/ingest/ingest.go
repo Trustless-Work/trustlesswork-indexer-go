@@ -7,6 +7,9 @@ import (
 	"time"
 
 	"github.com/Trustless-Work/Indexer/internal/services"
+	"github.com/Trustless-Work/Indexer/internal/sink"
+	sinkfactory "github.com/Trustless-Work/Indexer/internal/sink/factory"
+	"github.com/Trustless-Work/Indexer/internal/utils"
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
 	"github.com/stellar/go-stellar-sdk/support/log"
 )
@@ -20,6 +23,11 @@ const (
 	// LedgerBackendTypeDatastore uses cloud storage (S3/GCS) to fetch ledgers
 	LedgerBackendTypeDatastore LedgerBackendType = "datastore"
 )
+
+// httpClientTimeout is the per-request timeout for the shared HTTP client used
+// by the RPC service. RPC calls are typically sub-second; 30s leaves enough
+// headroom for transient slowdowns without hanging the ingestion loop.
+const httpClientTimeout = 30 * time.Second
 
 type Config struct {
 	IngestionMode          string
@@ -53,47 +61,61 @@ type Config struct {
 	CatchupThreshold int
 }
 
-func Ingest(cfg Config) error {
-	ctx := context.Background()
-
-	ingestService, err := setupDeps(cfg)
+// Ingest runs the ingestion pipeline using the provided context for
+// cancellation. It instantiates the sink from the environment, runs the loop,
+// and ensures the sink is closed on return.
+//
+// The caller is responsible for cancelling ctx (e.g. on SIGTERM) to trigger a
+// graceful shutdown.
+func Ingest(ctx context.Context, cfg Config) error {
+	outSink, err := sinkfactory.NewFromEnv()
 	if err != nil {
-		log.Ctx(ctx).Fatalf("Error setting up dependencies for ingest: %v", err)
+		return fmt.Errorf("building sink: %w", err)
+	}
+	defer utils.DeferredClose(ctx, outSink, "closing sink")
+
+	ingestService, err := setupDeps(ctx, cfg, outSink)
+	if err != nil {
+		return fmt.Errorf("setting up dependencies: %w", err)
 	}
 
-	if err = ingestService.Run(ctx, cfg.StartLedger, 0); err != nil {
-		log.Ctx(ctx).Fatalf("running 'ingest' from %d to %d: %v", cfg.StartLedger, cfg.EndLedger, err)
+	log.Ctx(ctx).Infof("Ingest starting (rpc=%s, network=%q, start=%d, end=%d)",
+		cfg.RPCURL, cfg.NetworkPassphrase, cfg.StartLedger, cfg.EndLedger)
+
+	if err := ingestService.Run(ctx, cfg.StartLedger, cfg.EndLedger); err != nil {
+		return fmt.Errorf("running ingest from %d to %d: %w", cfg.StartLedger, cfg.EndLedger, err)
 	}
 
 	return nil
 }
 
-func setupDeps(cfg Config) (services.IngestService, error) {
-
-	httpClient := &http.Client{Timeout: 30 * time.Second}
+func setupDeps(ctx context.Context, cfg Config, outSink sink.Sink) (services.IngestService, error) {
+	httpClient := &http.Client{Timeout: httpClientTimeout}
 
 	rpcService, err := services.NewRPCService(cfg.RPCURL, cfg.NetworkPassphrase, httpClient)
 	if err != nil {
 		return nil, fmt.Errorf("instantiating rpc service: %w", err)
 	}
 
-	ledgerBackend, err := NewLedgerBackend(context.Background(), cfg)
+	ledgerBackend, err := NewLedgerBackend(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("creating ledger backend: %w", err)
 	}
 
-	// Create a factory function for parallel backfill (each batch needs its own backend)
+	// Factory function for parallel backfill (each batch needs its own backend
+	// because LedgerBackend is not thread-safe).
 	ledgerBackendFactory := func(ctx context.Context) (ledgerbackend.LedgerBackend, error) {
 		return NewLedgerBackend(ctx, cfg)
 	}
 
-	ingestService, err := services.NewIngestService((services.IngestServiceConfig{
+	ingestService, err := services.NewIngestService(services.IngestServiceConfig{
 		IngestionMode:              cfg.IngestionMode,
 		LatestLedgerCursorName:     cfg.LatestLedgerCursorName,
 		OldestLedgerCursorName:     cfg.OldestLedgerCursorName,
 		RPCService:                 rpcService,
 		LedgerBackend:              ledgerBackend,
 		LedgerBackendFactory:       ledgerBackendFactory,
+		Sink:                       outSink,
 		GetLedgersLimit:            cfg.GetLedgersLimit,
 		Network:                    cfg.Network,
 		NetworkPassphrase:          cfg.NetworkPassphrase,
@@ -104,10 +126,11 @@ func setupDeps(cfg Config) (services.IngestService, error) {
 		BackfillBatchSize:          cfg.BackfillBatchSize,
 		BackfillDBInsertBatchSize:  cfg.BackfillDBInsertBatchSize,
 		CatchupThreshold:           cfg.CatchupThreshold,
-	}))
+	})
 	if err != nil {
 		return nil, fmt.Errorf("instantiating ingest service: %w", err)
 	}
 
 	return ingestService, nil
 }
+

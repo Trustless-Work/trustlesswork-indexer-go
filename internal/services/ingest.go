@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Trustless-Work/Indexer/internal/indexer"
+	"github.com/Trustless-Work/Indexer/internal/sink"
 	"github.com/Trustless-Work/Indexer/internal/utils"
 	"github.com/alitto/pond/v2"
 	"github.com/stellar/go-stellar-sdk/historyarchive"
@@ -20,6 +21,9 @@ import (
 const (
 	// maxLedgerFetchRetries is the maximum number of retry attempts when fetching a ledger fails.
 	maxLedgerFetchRetries = 10
+	// initialRetryBackoff is the initial backoff between retry attempts. It doubles
+	// on every failure up to maxRetryBackoff.
+	initialRetryBackoff = time.Second
 	// maxRetryBackoff is the maximum backoff duration between retry attempts.
 	maxRetryBackoff = 30 * time.Second
 	// IngestionModeLive represents continuous ingestion from the latest ledger onwards.
@@ -47,6 +51,10 @@ type IngestServiceConfig struct {
 	// === Ledger Backend ===
 	LedgerBackend        ledgerbackend.LedgerBackend
 	LedgerBackendFactory LedgerBackendFactory
+
+	// === Output ===
+	// Sink receives the processed buffer for every ledger. Required.
+	Sink sink.Sink
 
 	// === Cursors ===
 	LatestLedgerCursorName string
@@ -78,9 +86,20 @@ type ingestService struct {
 	networkPassphrase    string
 	getLedgersLimit      int
 	ledgerIndexer        *indexer.Indexer
+	sink                 sink.Sink
 }
 
 func NewIngestService(cfg IngestServiceConfig) (*ingestService, error) {
+	if cfg.RPCService == nil {
+		return nil, errors.New("rpc service is required")
+	}
+	if cfg.LedgerBackend == nil {
+		return nil, errors.New("ledger backend is required")
+	}
+	if cfg.Sink == nil {
+		return nil, errors.New("sink is required")
+	}
+
 	// Create worker pool for the ledger indexer (parallel transaction processing within a ledger)
 	ledgerIndexerPool := pond.NewPool(0)
 
@@ -91,41 +110,84 @@ func NewIngestService(cfg IngestServiceConfig) (*ingestService, error) {
 		networkPassphrase:    cfg.NetworkPassphrase,
 		getLedgersLimit:      cfg.GetLedgersLimit,
 		ledgerIndexer:        indexer.NewIndexer(cfg.NetworkPassphrase, ledgerIndexerPool, cfg.SkipTxMeta, cfg.SkipTxEnvelope),
+		sink:                 cfg.Sink,
 	}, nil
 }
 
 func (m *ingestService) Run(ctx context.Context, startLedger uint32, endLedger uint32) error {
 
 	// Prepare backend range
-	err := m.prepareBackendRange(ctx, startLedger, endLedger)
-	if err != nil {
+	if err := m.prepareBackendRange(ctx, startLedger, endLedger); err != nil {
 		return fmt.Errorf("preparing backend range: %w", err)
 	}
 
 	currentLedger := startLedger
 	log.Ctx(ctx).Infof("Starting ingestion loop from ledger: %d", currentLedger)
-	for endLedger == 0 || currentLedger < endLedger {
-		ledgerMeta, ledgerErr := m.ledgerBackend.GetLedger(ctx, currentLedger)
-		if ledgerErr != nil {
-			if endLedger > 0 && currentLedger > endLedger {
-				log.Ctx(ctx).Infof("Backfill complete: processed ledgers %d to %d", startLedger, endLedger)
-				return nil
-			}
-			log.Ctx(ctx).Warnf("Error fetching ledger %d: %v, retrying...", currentLedger, ledgerErr)
-			time.Sleep(time.Second)
-			continue
+	for endLedger == 0 || currentLedger <= endLedger {
+		if err := ctx.Err(); err != nil {
+			log.Ctx(ctx).Infof("Ingestion loop stopped at ledger %d: %v", currentLedger, err)
+			return nil
+		}
+
+		ledgerMeta, err := m.fetchLedgerWithRetry(ctx, currentLedger)
+		if err != nil {
+			return fmt.Errorf("fetching ledger %d: %w", currentLedger, err)
 		}
 
 		totalStart := time.Now()
-		if processErr := m.processLedger(ctx, ledgerMeta); processErr != nil {
-			return fmt.Errorf("processing ledger %d: %w", currentLedger, processErr)
+		if err := m.processLedger(ctx, ledgerMeta); err != nil {
+			return fmt.Errorf("processing ledger %d: %w", currentLedger, err)
 		}
 
 		log.Ctx(ctx).Infof("Processed ledger %d in %v", currentLedger, time.Since(totalStart))
 		currentLedger++
-
 	}
+
+	log.Ctx(ctx).Infof("Backfill complete: processed ledgers %d to %d", startLedger, endLedger)
 	return nil
+}
+
+// fetchLedgerWithRetry calls GetLedger with bounded exponential backoff. It
+// honours ctx cancellation between attempts and gives up after
+// maxLedgerFetchRetries failures.
+func (m *ingestService) fetchLedgerWithRetry(ctx context.Context, ledgerSeq uint32) (xdr.LedgerCloseMeta, error) {
+	backoff := initialRetryBackoff
+	var lastErr error
+
+	for attempt := 1; attempt <= maxLedgerFetchRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return xdr.LedgerCloseMeta{}, err
+		}
+
+		ledgerMeta, err := m.ledgerBackend.GetLedger(ctx, ledgerSeq)
+		if err == nil {
+			return ledgerMeta, nil
+		}
+
+		// Surface context cancellation immediately — it is not transient.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return xdr.LedgerCloseMeta{}, err
+		}
+
+		lastErr = err
+		log.Ctx(ctx).Warnf("Error fetching ledger %d (attempt %d/%d): %v, retrying in %v",
+			ledgerSeq, attempt, maxLedgerFetchRetries, err, backoff)
+
+		select {
+		case <-ctx.Done():
+			return xdr.LedgerCloseMeta{}, ctx.Err()
+		case <-time.After(backoff):
+		}
+
+		if backoff < maxRetryBackoff {
+			backoff *= 2
+			if backoff > maxRetryBackoff {
+				backoff = maxRetryBackoff
+			}
+		}
+	}
+
+	return xdr.LedgerCloseMeta{}, fmt.Errorf("giving up after %d attempts: %w", maxLedgerFetchRetries, lastErr)
 }
 
 // prepareBackendRange prepares the ledger backend with the appropriate range type.
@@ -149,7 +211,7 @@ func (m *ingestService) prepareBackendRange(ctx context.Context, startLedger, en
 // processLedger processes a single ledger through all ingestion phases.
 // Phase 1: Get transactions from ledger
 // Phase 2: Process transactions using Indexer (parallel within ledger)
-// Phase 3: Insert all data into DB
+// Phase 3: Hand the processed buffer to the configured Sink
 func (m *ingestService) processLedger(ctx context.Context, ledgerMeta xdr.LedgerCloseMeta) error {
 	ledgerSeq := ledgerMeta.LedgerSequence()
 
@@ -161,15 +223,14 @@ func (m *ingestService) processLedger(ctx context.Context, ledgerMeta xdr.Ledger
 
 	// Phase 2: Process transactions using Indexer (parallel within ledger)
 	buffer := indexer.NewIndexerBuffer()
-	_, err = m.ledgerIndexer.ProcessLedgerTransactions(ctx, transactions, buffer)
-	if err != nil {
+	if _, err := m.ledgerIndexer.ProcessLedgerTransactions(ctx, transactions, buffer); err != nil {
 		return fmt.Errorf("processing transactions for ledger %d: %w", ledgerSeq, err)
 	}
 
-	// Phase 3: Insert all data into DB
-	//if err := m.ingestProcessedData(ctx, buffer); err != nil {
-	//	return fmt.Errorf("ingesting processed data for ledger %d: %w", ledgerSeq, err)
-	//}
+	// Phase 3: Hand the buffer to the configured sink.
+	if err := m.sink.Write(ctx, buffer, ledgerSeq); err != nil {
+		return fmt.Errorf("writing ledger %d to sink: %w", ledgerSeq, err)
+	}
 
 	return nil
 }
@@ -181,7 +242,12 @@ func (m *ingestService) getLedgerTransactions(ctx context.Context, xdrLedgerClos
 	}
 	defer utils.DeferredClose(ctx, ledgerTxReader, "closing ledger transaction reader")
 
-	transactions := make([]ingest.LedgerTransaction, 0)
+	// Pre-allocate with the limit hint to avoid repeated slice growth on busy ledgers.
+	initialCapacity := m.getLedgersLimit
+	if initialCapacity <= 0 {
+		initialCapacity = 64
+	}
+	transactions := make([]ingest.LedgerTransaction, 0, initialCapacity)
 	for {
 		tx, err := ledgerTxReader.Read()
 		if err != nil {
