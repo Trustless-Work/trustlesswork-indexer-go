@@ -4,28 +4,46 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/Trustless-Work/Indexer/internal/config"
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
 	"github.com/stellar/go-stellar-sdk/support/log"
 )
 
-func NewLedgerBackend(ctx context.Context, cfg Config) (ledgerbackend.LedgerBackend, error) {
-	switch cfg.LedgerBackendType {
+// LedgerBackendType represents the type of ledger backend to use.
+type LedgerBackendType string
+
+const (
+	// LedgerBackendTypeRPC uses RPC to fetch ledgers (the only
+	// implementation today).
+	LedgerBackendTypeRPC LedgerBackendType = "rpc"
+	// LedgerBackendTypeDatastore reads archived ledgers from cloud
+	// object storage (S3/GCS). Stubbed; not implemented.
+	LedgerBackendTypeDatastore LedgerBackendType = "datastore"
+)
+
+// NewLedgerBackend constructs a LedgerBackend matching cfg.Indexer.
+// The choice is driven by INDEXER_LEDGER_BACKEND_TYPE; "rpc" is the
+// only supported value today. "datastore" is reserved for a future
+// S3/GCS-backed implementation.
+func NewLedgerBackend(ctx context.Context, cfg *config.Config) (ledgerbackend.LedgerBackend, error) {
+	switch LedgerBackendType(cfg.Indexer.LedgerBackendType) {
 	case LedgerBackendTypeDatastore:
-		//return newDatastoreLedgerBackend(ctx, cfg)
-		// TODO: Implement the DatastoreBackend
-		return nil, fmt.Errorf("datastore backend not supported yet")
+		return nil, fmt.Errorf("datastore backend not implemented yet")
 	case LedgerBackendTypeRPC:
-		return newRPCLedgerBackend(cfg)
+		return newRPCLedgerBackend(cfg), nil
 	default:
-		return nil, fmt.Errorf("unsupported ledger backend type: %s", cfg.LedgerBackendType)
+		return nil, fmt.Errorf("unsupported ledger backend type %q", cfg.Indexer.LedgerBackendType)
 	}
 }
 
-func newRPCLedgerBackend(cfg Config) (ledgerbackend.LedgerBackend, error) {
+// newRPCLedgerBackend builds an RPC-backed LedgerBackend using
+// cfg.RPC.URL and cfg.Indexer.GetLedgersLimit as the internal buffer
+// hint.
+func newRPCLedgerBackend(cfg *config.Config) ledgerbackend.LedgerBackend {
 	backend := ledgerbackend.NewRPCLedgerBackend(ledgerbackend.RPCLedgerBackendOptions{
-		RPCServerURL: cfg.RPCURL,
-		BufferSize:   uint32(cfg.GetLedgersLimit),
+		RPCServerURL: cfg.RPC.URL,
+		BufferSize:   uint32(cfg.Indexer.GetLedgersLimit),
 	})
-	log.Infof("Using RPCLedgerBackend for ledger ingestion with buffer size %d", cfg.GetLedgersLimit)
-	return backend, nil
+	log.Infof("Using RPCLedgerBackend (buffer=%d) against %s", cfg.Indexer.GetLedgersLimit, cfg.RPC.URL)
+	return backend
 }

@@ -1,129 +1,220 @@
+// Package ingest is the composition root for the Indexer pipeline. It
+// wires together the durable state, the sink, the detector, the
+// publisher and the orchestration service from a single *config.Config.
+//
+// Boot sequence on Ingest():
+//
+//  1. Open the state store (acquires the advisory lock).
+//  2. Load or initialize State (cursor + watchlist). On STATE_RESET=true
+//     the existing state is ignored. On first boot the watchlist seed
+//     (WATCHLIST_SEED_PATH) is loaded if present.
+//  3. Validate the loaded state against the configured network. A
+//     mismatch is fatal — operator must intervene.
+//  4. Resolve the starting ledger:
+//       - persistent cursor present → resume at LastLedgerSeq + 1
+//       - else INDEXER_START_LEDGER > 0 → use it
+//       - else fetch the current network tip from the RPC health
+//         endpoint and start there.
+//  5. Construct the sink, publisher, detector, ledger backend, and
+//     ingest service.
+//  6. Run the loop until ctx cancellation or terminal error.
+//
+// The caller (cmd/ingest.go) is responsible for ctx, signal handling,
+// and config loading. Ingest itself never reads env vars.
 package ingest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
+	"github.com/Trustless-Work/Indexer/internal/config"
+	"github.com/Trustless-Work/Indexer/internal/detector"
+	"github.com/Trustless-Work/Indexer/internal/events"
+	"github.com/Trustless-Work/Indexer/internal/metrics"
+	"github.com/Trustless-Work/Indexer/internal/publisher"
 	"github.com/Trustless-Work/Indexer/internal/services"
-	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
+	sinkpkg "github.com/Trustless-Work/Indexer/internal/sink"
+	sinkfactory "github.com/Trustless-Work/Indexer/internal/sink/factory"
+	"github.com/Trustless-Work/Indexer/internal/state"
+	"github.com/Trustless-Work/Indexer/internal/utils"
 	"github.com/stellar/go-stellar-sdk/support/log"
 )
 
-// LedgerBackendType represents the type of ledger backend to use
-type LedgerBackendType string
-
-const (
-	// LedgerBackendTypeRPC uses RPC to fetch ledgers
-	LedgerBackendTypeRPC LedgerBackendType = "rpc"
-	// LedgerBackendTypeDatastore uses cloud storage (S3/GCS) to fetch ledgers
-	LedgerBackendTypeDatastore LedgerBackendType = "datastore"
-)
-
-// httpClientTimeout is the per-request timeout for the shared HTTP client used
-// by the RPC service. RPC calls are typically sub-second; 30s leaves enough
-// headroom for transient slowdowns without hanging the ingestion loop.
+// httpClientTimeout is the per-request timeout for the auxiliary HTTP
+// client used to call the RPC health endpoint at boot. Generous because
+// it's a one-off; the per-ledger fetch path uses the SDK's own client.
 const httpClientTimeout = 30 * time.Second
 
-type Config struct {
-	IngestionMode          string
-	LatestLedgerCursorName string
-	OldestLedgerCursorName string
-	StartLedger            uint32
-	EndLedger              uint32
-	RPCURL                 string
-	Network                string
-	NetworkPassphrase      string
-	GetLedgersLimit        int
-	LedgerBackendType      LedgerBackendType
-	// SkipTxMeta skips storing transaction metadata (meta_xdr) to reduce storage space
-	SkipTxMeta bool
-	// SkipTxEnvelope skips storing transaction envelope (envelope_xdr) to reduce storage space
-	SkipTxEnvelope bool
-	// EnableParticipantFiltering controls whether to filter ingested data by pre-registered accounts.
-	// When false (default), all data is stored. When true, only data for pre-registered accounts is stored.
-	EnableParticipantFiltering bool
-	// BackfillWorkers limits concurrent batch processing during backfill.
-	// Defaults to runtime.NumCPU(). Lower values reduce RAM usage.
-	BackfillWorkers int
-	// BackfillBatchSize is the number of ledgers processed per batch during backfill.
-	// Defaults to 250. Lower values reduce RAM usage at cost of more DB transactions.
-	BackfillBatchSize int
-	// BackfillDBInsertBatchSize is the number of ledgers to process before flushing to DB.
-	// Defaults to 50. Lower values reduce RAM usage at cost of more DB transactions.
-	BackfillDBInsertBatchSize int
-	// CatchupThreshold is the number of ledgers behind network tip that triggers fast catchup.
-	// Defaults to 100.
-	CatchupThreshold int
-}
-
-// Ingest runs the ingestion pipeline using the provided context for
-// cancellation. The caller is responsible for cancelling ctx (e.g. on
-// SIGTERM) to trigger graceful shutdown.
+// Ingest is the entry point of the Indexer pipeline. It blocks until
+// ctx cancellation or terminal error.
 //
-// NOTE (Phase 2 of overhaul, 2026-05-13): sink wiring was removed
-// because the Sink interface switched to a per-envelope contract. The
-// new Publisher path that walks the processed buffer, builds Envelopes
-// and calls sink.Publish lives in the next phase of the overhaul. Until
-// then this function processes ledgers without emitting anything.
-func Ingest(ctx context.Context, cfg Config) error {
-	ingestService, err := setupDeps(ctx, cfg)
+// Errors are returned with %w wrapping the underlying sentinel; the
+// caller can distinguish operator-correctable errors (network
+// mismatch, lock conflict, missing required config) from runtime ones.
+func Ingest(ctx context.Context, cfg *config.Config) error {
+	log.Ctx(ctx).Info(cfg.String())
+
+	// --- State + watchlist -----------------------------------------
+	store, err := state.NewFileStore(cfg.State.Path)
 	if err != nil {
-		return fmt.Errorf("setting up dependencies: %w", err)
+		return fmt.Errorf("opening state store: %w", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			log.Ctx(ctx).Warnf("closing state store: %v", err)
+		}
+	}()
+
+	current, startLedger, err := loadOrInitState(ctx, cfg, store)
+	if err != nil {
+		return err
 	}
 
-	log.Ctx(ctx).Infof("Ingest starting (rpc=%s, network=%q, start=%d, end=%d)",
-		cfg.RPCURL, cfg.NetworkPassphrase, cfg.StartLedger, cfg.EndLedger)
+	watchlist := state.NewWatchlist(current.EscrowContracts)
+	metrics.SetWatchlistSize(cfg.Network.Name, watchlist.Size())
 
-	if err := ingestService.Run(ctx, cfg.StartLedger, cfg.EndLedger); err != nil {
-		return fmt.Errorf("running ingest from %d to %d: %w", cfg.StartLedger, cfg.EndLedger, err)
+	log.Ctx(ctx).Infof("State ready: start_ledger=%d, watchlist_size=%d", startLedger, watchlist.Size())
+
+	// --- Sink + publisher ------------------------------------------
+	outSink, err := sinkfactory.New(cfg)
+	if err != nil {
+		return fmt.Errorf("building sink: %w", err)
+	}
+	defer utils.DeferredClose(ctx, outSink, "closing sink")
+	updateSinkUp(ctx, cfg.Sink.Type, outSink)
+
+	pub := publisher.New(cfg.Network.Name, outSink)
+
+	// --- Detector --------------------------------------------------
+	det := detector.New(cfg.Network.Passphrase, cfg.Network.Name, events.DefaultTWTopicFilter(), watchlist)
+
+	// --- Ledger backend --------------------------------------------
+	ledgerBackend, err := NewLedgerBackend(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("creating ledger backend: %w", err)
 	}
 
+	// --- Ingest service --------------------------------------------
+	svc, err := services.NewIngestService(services.IngestServiceConfig{
+		NetworkName:       cfg.Network.Name,
+		NetworkPassphrase: cfg.Network.Passphrase,
+		LedgerBackend:     ledgerBackend,
+		Detector:          det,
+		Publisher:         pub,
+		StateStore:        store,
+		Watchlist:         watchlist,
+		StrictMode:        cfg.StrictMode,
+	})
+	if err != nil {
+		return fmt.Errorf("constructing ingest service: %w", err)
+	}
+
+	log.Ctx(ctx).Infof("Ingest starting (network=%s, start=%d, end=%d, strict=%v)",
+		cfg.Network.Name, startLedger, cfg.Indexer.EndLedger, cfg.StrictMode)
+
+	if err := svc.Run(ctx, startLedger, cfg.Indexer.EndLedger, current); err != nil {
+		return fmt.Errorf("running ingest from %d to %d: %w", startLedger, cfg.Indexer.EndLedger, err)
+	}
 	return nil
 }
 
-func setupDeps(ctx context.Context, cfg Config) (services.IngestService, error) {
-	httpClient := &http.Client{Timeout: httpClientTimeout}
-
-	rpcService, err := services.NewRPCService(cfg.RPCURL, cfg.NetworkPassphrase, httpClient)
-	if err != nil {
-		return nil, fmt.Errorf("instantiating rpc service: %w", err)
+// loadOrInitState figures out the boot State and the ledger to start
+// at. The logic in one place:
+//
+//   - STATE_RESET=true OR no state file exists → first-boot path:
+//     build a fresh State, seed watchlist from WATCHLIST_SEED_PATH,
+//     start from INDEXER_START_LEDGER (or RPC tip if 0).
+//   - State file exists and matches network → resume from
+//     cursor + 1.
+//   - State file exists but network mismatches → ErrStateNetworkMismatch
+//     (fatal).
+//   - State file exists but is corrupted / unsupported version → the
+//     underlying state.* sentinel propagates (fatal).
+func loadOrInitState(ctx context.Context, cfg *config.Config, store state.Store) (state.State, uint32, error) {
+	if cfg.State.Reset {
+		log.Ctx(ctx).Info("STATE_RESET=true — ignoring any existing state file")
+		return initialState(ctx, cfg)
 	}
 
-	ledgerBackend, err := NewLedgerBackend(ctx, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("creating ledger backend: %w", err)
+	loaded, err := store.Load(ctx)
+	switch {
+	case errors.Is(err, state.ErrStateNotFound):
+		log.Ctx(ctx).Info("No state file found — initializing fresh state")
+		return initialState(ctx, cfg)
+	case err != nil:
+		return state.State{}, 0, fmt.Errorf("loading state: %w", err)
 	}
 
-	// Factory function for parallel backfill (each batch needs its own backend
-	// because LedgerBackend is not thread-safe).
-	ledgerBackendFactory := func(ctx context.Context) (ledgerbackend.LedgerBackend, error) {
-		return NewLedgerBackend(ctx, cfg)
+	if loaded.Network != cfg.Network.Passphrase {
+		return state.State{}, 0, fmt.Errorf("%w: state has %q, configured %q",
+			state.ErrStateNetworkMismatch, loaded.Network, cfg.Network.Passphrase)
 	}
 
-	ingestService, err := services.NewIngestService(services.IngestServiceConfig{
-		IngestionMode:              cfg.IngestionMode,
-		LatestLedgerCursorName:     cfg.LatestLedgerCursorName,
-		OldestLedgerCursorName:     cfg.OldestLedgerCursorName,
-		RPCService:                 rpcService,
-		LedgerBackend:              ledgerBackend,
-		LedgerBackendFactory:       ledgerBackendFactory,
-		GetLedgersLimit:            cfg.GetLedgersLimit,
-		Network:                    cfg.Network,
-		NetworkPassphrase:          cfg.NetworkPassphrase,
-		SkipTxMeta:                 cfg.SkipTxMeta,
-		SkipTxEnvelope:             cfg.SkipTxEnvelope,
-		EnableParticipantFiltering: cfg.EnableParticipantFiltering,
-		BackfillWorkers:            cfg.BackfillWorkers,
-		BackfillBatchSize:          cfg.BackfillBatchSize,
-		BackfillDBInsertBatchSize:  cfg.BackfillDBInsertBatchSize,
-		CatchupThreshold:           cfg.CatchupThreshold,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("instantiating ingest service: %w", err)
-	}
-
-	return ingestService, nil
+	startLedger := loaded.LastLedgerSeq + 1
+	log.Ctx(ctx).Infof("Resuming from state: last_ledger=%d, next=%d, watchlist_size=%d",
+		loaded.LastLedgerSeq, startLedger, len(loaded.EscrowContracts))
+	return loaded, startLedger, nil
 }
 
+// initialState builds a State for a clean boot: empty cursor, watchlist
+// seeded from WATCHLIST_SEED_PATH (if any), and a start_ledger chosen
+// from INDEXER_START_LEDGER or the RPC tip.
+func initialState(ctx context.Context, cfg *config.Config) (state.State, uint32, error) {
+	seedIDs, err := state.LoadSeed(cfg.Watchlist.SeedPath)
+	if err != nil {
+		return state.State{}, 0, fmt.Errorf("loading watchlist seed: %w", err)
+	}
+	if len(seedIDs) > 0 {
+		log.Ctx(ctx).Infof("Loaded %d entries from watchlist seed %q", len(seedIDs), cfg.Watchlist.SeedPath)
+	}
+
+	startLedger := cfg.Indexer.StartLedger
+	if startLedger == 0 {
+		tip, err := fetchLatestLedger(ctx, cfg)
+		if err != nil {
+			return state.State{}, 0, fmt.Errorf("resolving start ledger from RPC tip: %w", err)
+		}
+		log.Ctx(ctx).Infof("START_LEDGER unset; using RPC tip %d", tip)
+		startLedger = tip
+	}
+
+	s := state.NewState(cfg.Network.Passphrase, events.CurrentSchemaVersion).
+		WithWatchlist(seedIDs)
+	return s, startLedger, nil
+}
+
+// fetchLatestLedger queries the configured RPC's health endpoint for
+// its current latest ledger. Used only at first boot to choose a
+// reasonable starting point when none was configured.
+func fetchLatestLedger(ctx context.Context, cfg *config.Config) (uint32, error) {
+	_ = ctx // RPCService methods don't accept ctx yet; reserved for Phase 4.
+
+	httpClient := &http.Client{Timeout: httpClientTimeout}
+	rpc, err := services.NewRPCService(cfg.RPC.URL, cfg.Network.Passphrase, httpClient)
+	if err != nil {
+		return 0, err
+	}
+	health, err := rpc.GetHealth()
+	if err != nil {
+		return 0, err
+	}
+	return health.LatestLedger, nil
+}
+
+// updateSinkUp probes the sink (if it supports HealthChecker) and
+// updates the indexer_sink_up gauge. Best-effort — a probe failure
+// here does not block boot. The gauge tells operators the answer; the
+// main loop will surface a real failure on the first Publish attempt.
+func updateSinkUp(ctx context.Context, sinkType string, s sinkpkg.Sink) {
+	hc, ok := s.(sinkpkg.HealthChecker)
+	if !ok {
+		// Sinks without health probes are reported as up by default;
+		// they cannot fail in a probeable way.
+		metrics.SetSinkUp(sinkType, true)
+		return
+	}
+	metrics.SetSinkUp(sinkType, hc.Ping(ctx) == nil)
+}

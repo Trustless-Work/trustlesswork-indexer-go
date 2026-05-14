@@ -1,101 +1,129 @@
+// Command ingest is the Indexer's entry point. It loads the
+// centralized configuration, installs the configured logger, sets up
+// graceful shutdown on SIGINT/SIGTERM, and hands control to the
+// composition root in internal/ingest.
+//
+// Concretely, main does as little as possible. Configuration, state
+// loading, sink construction and the actual pipeline live behind a
+// single ingest.Ingest call. This keeps main free of business logic
+// and makes the run() function testable in principle (no os.Exit, no
+// log.Fatal).
 package main
 
 import (
 	"context"
 	"errors"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
+	"github.com/Trustless-Work/Indexer/internal/config"
 	"github.com/Trustless-Work/Indexer/internal/ingest"
-	"github.com/Trustless-Work/Indexer/internal/services"
 	"github.com/sirupsen/logrus"
 	"github.com/stellar/go-stellar-sdk/support/log"
 )
 
-// rpcHealthTimeout bounds the initial RPC health probe used to discover the
-// latest ledger when START_LEDGER is not provided.
-const rpcHealthTimeout = 10 * time.Second
-
-// envLogLevel selects the logrus level (e.g. "info", "debug", "trace").
-const envLogLevel = "LOG_LEVEL"
-
 func main() {
-	preConfigureLogger()
-	log.Info("Starting ingest...")
-
-	// Cancel ctx on SIGINT/SIGTERM so the ingestion loop and sink shut down
+	// Cancel ctx on SIGINT/SIGTERM so the pipeline shuts down
 	// gracefully instead of being killed mid-ledger.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	if err := run(ctx); err != nil {
-		// Context cancellation is the expected exit path on SIGTERM and is not
-		// a failure — exit cleanly.
+		// Context cancellation is the expected exit path on SIGTERM
+		// and is not a failure — exit cleanly.
 		if errors.Is(err, context.Canceled) {
 			log.Info("Ingest stopped by signal")
 			return
+		}
+		// Logger may not be configured if config failed before
+		// preConfigureLogger(); fall back to stderr in that case.
+		if log.DefaultLogger == nil {
+			logrus.WithError(err).Fatal("ingest: fatal startup error")
 		}
 		log.Fatalf("ingest: %v", err)
 	}
 }
 
-// run wires configuration, resolves the starting ledger if needed, and
-// delegates to ingest.Ingest. Returning errors (rather than calling Fatal)
-// keeps main testable and ensures deferred Close() calls in callees run.
+// run loads config, configures the logger, and delegates to
+// ingest.Ingest. Returns errors instead of calling Fatal so that
+// deferred Close calls in callees run cleanly.
 func run(ctx context.Context) error {
-	cfg, err := ingest.LoadConfigFromEnv()
+	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
 
-	if cfg.StartLedger == 0 {
-		latest, err := fetchLatestLedger(ctx, cfg)
-		if err != nil {
-			return err
-		}
-		log.Infof("START_LEDGER unset; using latest ledger from RPC: %d", latest)
-		cfg.StartLedger = latest
-	}
+	configureLogger(cfg)
 
+	log.Ctx(ctx).Info("Starting Indexer")
 	return ingest.Ingest(ctx, cfg)
 }
 
-// fetchLatestLedger queries the RPC health endpoint to discover the current
-// network tip. Used when no explicit START_LEDGER is provided.
-func fetchLatestLedger(ctx context.Context, cfg ingest.Config) (uint32, error) {
-	httpClient := &http.Client{Timeout: rpcHealthTimeout}
-
-	rpcClient, err := services.NewRPCService(cfg.RPCURL, cfg.NetworkPassphrase, httpClient)
-	if err != nil {
-		return 0, err
+// configureLogger applies cfg.Logging to both the global logrus
+// logger (used directly by the sink/* packages via logrus.WithFields)
+// and to the Stellar SDK's log wrapper (used by services and rpc via
+// log.Ctx). The two loggers are independent instances in the SDK
+// version we use, so we configure both to avoid mixed output.
+//
+// LOG_FORMAT semantics:
+//   - "json": JSON formatter always.
+//   - "text": text formatter always.
+//   - "auto" (default): text if stdout is a TTY, JSON otherwise. The
+//     conservative default for containers (stdout piped) is JSON.
+func configureLogger(cfg *config.Config) {
+	level := logrus.InfoLevel
+	if parsed, err := logrus.ParseLevel(cfg.Logging.Level); err == nil {
+		level = parsed
 	}
 
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
+	formatter := chooseFormatter(cfg.Logging.Format)
 
-	health, err := rpcClient.GetHealth()
-	if err != nil {
-		return 0, err
-	}
+	// Global logrus instance: drives direct logrus.WithFields calls in
+	// the sink packages.
+	logrus.SetLevel(level)
+	logrus.SetFormatter(formatter)
 
-	return health.LatestLedger, nil
+	// Stellar SDK log wrapper: drives log.Ctx(ctx) calls in services.
+	// SetFormatter is not exposed by support/log.Entry; we can only
+	// install the level. Operators wanting the JSON formatter on these
+	// lines should pipe stdout into a separate JSON-emitting structlog
+	// processor, or switch the project to use logrus directly. Tracked
+	// for a follow-up sprint.
+	stellarLogger := log.New()
+	stellarLogger.SetLevel(level)
+	log.DefaultLogger = stellarLogger
 }
 
-// preConfigureLogger installs the default logger using LOG_LEVEL (default
-// info). Trace-level was the previous default and was too noisy for
-// production deployments.
-func preConfigureLogger() {
-	logger := log.New()
-	level := logrus.InfoLevel
-	if raw := os.Getenv(envLogLevel); raw != "" {
-		if parsed, err := logrus.ParseLevel(raw); err == nil {
-			level = parsed
+// chooseFormatter resolves cfg.Logging.Format to a concrete formatter.
+// Defaults to JSON for any value other than "json"/"text"/"auto"; the
+// config Validate() layer rejects anything outside those, so a default
+// here is purely defensive.
+func chooseFormatter(format string) logrus.Formatter {
+	switch format {
+	case "json":
+		return &logrus.JSONFormatter{TimestampFormat: "2006-01-02T15:04:05.000Z07:00"}
+	case "text":
+		return &logrus.TextFormatter{FullTimestamp: true}
+	default: // "auto" and anything else
+		if isTTY(os.Stdout) {
+			return &logrus.TextFormatter{FullTimestamp: true}
 		}
+		return &logrus.JSONFormatter{TimestampFormat: "2006-01-02T15:04:05.000Z07:00"}
 	}
-	logger.SetLevel(level)
-	log.DefaultLogger = logger
+}
+
+// isTTY reports whether the given file is attached to a terminal.
+// Used to drive the auto-detection of LOG_FORMAT. Returns false on
+// systems that don't expose os.File.Stat() reliably; the conservative
+// default (false → JSON) is correct for containers.
+func isTTY(f *os.File) bool {
+	if f == nil {
+		return false
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return (info.Mode() & os.ModeCharDevice) != 0
 }
