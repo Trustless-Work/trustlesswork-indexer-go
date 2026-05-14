@@ -34,6 +34,7 @@ import (
 	"errors"
 
 	"github.com/Trustless-Work/Indexer/internal/events"
+	"github.com/Trustless-Work/Indexer/internal/rpc"
 	"github.com/Trustless-Work/Indexer/internal/state"
 )
 
@@ -46,6 +47,7 @@ import (
 //   - state.ErrStateVersionMismatch: state was written by a newer binary.
 //   - state.ErrStateNetworkMismatch: state belongs to a different network.
 //   - state.ErrStateLockHeld: another Indexer instance is active.
+//   - rpc.ErrLedgerOutOfRetention: cursor is older than the RPC's retention.
 //   - events.ErrEnvelopeInvalid: we built a malformed envelope (bug).
 func IsFatal(err error) bool {
 	switch {
@@ -53,6 +55,7 @@ func IsFatal(err error) bool {
 		errors.Is(err, state.ErrStateVersionMismatch),
 		errors.Is(err, state.ErrStateNetworkMismatch),
 		errors.Is(err, state.ErrStateLockHeld),
+		errors.Is(err, rpc.ErrLedgerOutOfRetention),
 		errors.Is(err, events.ErrEnvelopeInvalid):
 		return true
 	}

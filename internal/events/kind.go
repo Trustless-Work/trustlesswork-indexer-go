@@ -34,11 +34,17 @@ const (
 // Indexer-synthesized event kinds. These are NOT emitted by TW contracts;
 // the Indexer detects them via heuristics (e.g. SAC transfer events whose
 // destination is in the escrow watchlist) and labels them with these
-// namespaced names so consumers can route them distinctly.
+// names so consumers can route them distinctly.
+//
+// Naming convention: snake_case, no dots. Dots are AMQP routing-key
+// separators — embedding them in the EventKind would break the
+// `stellar.<network>.escrow.<kind>` segmentation and prevent consumers
+// from using a single-segment wildcard binding like
+// `stellar.testnet.escrow.*`.
 const (
 	// EventKindTokenTransfer is emitted for a SAC or SEP-41 `transfer`
 	// event where `to` or `from` is a known escrow contract.
-	EventKindTokenTransfer EventKind = "token.transfer"
+	EventKindTokenTransfer EventKind = "token_transfer"
 )
 
 // AllTWTopics returns the canonical set of TW-emitted topic Symbols. This is

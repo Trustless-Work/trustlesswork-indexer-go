@@ -1,223 +1,315 @@
+// Package rabbitmq publishes Indexer envelopes to a RabbitMQ topic
+// exchange, one message per envelope. With publisher confirms enabled
+// (the production default), Publish blocks on a positive ack from the
+// broker before returning success — that ack is what justifies advancing
+// the cursor.
+//
+// Routing key shape: stellar.<network>.escrow.<event_kind>
+// Examples:
+//   stellar.testnet.escrow.tw_init
+//   stellar.testnet.escrow.tw_fund
+//   stellar.testnet.escrow.token_transfer
+//
+// The Indexer does NOT declare queues. Consumers (the Core) declare and
+// bind their own queues against this exchange. The Indexer only owns the
+// exchange declaration and assumes that fan-out semantics live downstream.
+//
+// Concurrency: amqp.Channel is NOT safe for concurrent use, and publisher
+// confirms arrive in publish order. RabbitMQSink serializes Publish calls
+// with an internal mutex; callers may invoke Publish from multiple
+// goroutines, but contention will degrade throughput. The intended use is
+// the single-goroutine publisher in the main loop.
 package rabbitmq
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"reflect"
+	"sync"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/sirupsen/logrus"
 
+	"github.com/Trustless-Work/Indexer/internal/events"
 	"github.com/Trustless-Work/Indexer/internal/sink"
 )
 
-// RabbitMQSink publishes processed ledger data to a RabbitMQ topic exchange.
-// Each entity category is published as a separate message with its own routing key.
-//
-// Routing key pattern: stellar.<network>.<entity>
-// Examples:
-//   - stellar.testnet.escrow
-//   - stellar.testnet.state_change
-//   - stellar.testnet.transaction
-//   - stellar.testnet.operation
-//   - stellar.testnet.trustline_change
-//   - stellar.testnet.contract_change
+// reconnectMaxAttempts bounds how many times we retry the AMQP dial+open
+// sequence on a single Publish failure before giving up. The Publisher in
+// the main loop has its own retry-with-backoff above this, so this is just
+// inner-loop resilience for transient blips, not the global retry policy.
+const reconnectMaxAttempts = 5
+
+// RabbitMQSink delivers envelopes to a RabbitMQ topic exchange.
 type RabbitMQSink struct {
-	conn    *amqp.Connection
-	channel *amqp.Channel
-	cfg     Config
+	cfg Config
+
+	// mu serializes Publish calls and protects the conn/channel/confirms
+	// fields against concurrent access during reconnects.
+	mu       sync.Mutex
+	conn     *amqp.Connection
+	channel  *amqp.Channel
+	confirms chan amqp.Confirmation // nil when PublisherConfirms is false
 }
 
-// envelope wraps a payload with ledger metadata so consumers have full context
-// without needing to parse the payload.
-type envelope struct {
-	LedgerSeq uint32      `json:"ledger_seq"`
-	Network   string      `json:"network"`
-	EventType string      `json:"event_type"`
-	Timestamp time.Time   `json:"timestamp"`
-	Payload   interface{} `json:"payload"`
-}
+// Compile-time check that RabbitMQSink satisfies the sink contracts.
+var (
+	_ sink.Sink          = (*RabbitMQSink)(nil)
+	_ sink.HealthChecker = (*RabbitMQSink)(nil)
+)
 
-var _ sink.Sink = (*RabbitMQSink)(nil)
-
-// New creates a RabbitMQSink and establishes the initial connection.
+// New constructs a RabbitMQSink and establishes the initial AMQP
+// connection. Returns a wrapped error if the connection cannot be
+// established; the caller should treat that as fail-fast at boot.
 func New(cfg Config) (*RabbitMQSink, error) {
-	s := &RabbitMQSink{cfg: cfg}
+	if cfg.URL == "" {
+		return nil, fmt.Errorf("rabbitmq: URL is required")
+	}
+	if cfg.Exchange == "" {
+		return nil, fmt.Errorf("rabbitmq: Exchange is required")
+	}
+	if cfg.Network == "" {
+		return nil, fmt.Errorf("rabbitmq: Network is required")
+	}
+
+	s := &RabbitMQSink{cfg: cfg.withDefaults()}
 	if err := s.connect(); err != nil {
-		return nil, fmt.Errorf("rabbitmq sink: initial connection failed: %w", err)
+		return nil, fmt.Errorf("rabbitmq: initial connect: %w", err)
 	}
 	return s, nil
 }
 
-// connect establishes the AMQP connection, opens a channel, and declares the exchange.
+// connect establishes a fresh AMQP connection, opens a channel, declares
+// the exchange, and (when configured) registers a publisher-confirm
+// listener. Caller must hold s.mu OR be running before the sink is
+// shared with anyone (i.e. inside New).
 func (s *RabbitMQSink) connect() error {
 	conn, err := amqp.Dial(s.cfg.URL)
 	if err != nil {
-		return fmt.Errorf("dialing %q: %w", s.cfg.URL, err)
+		return fmt.Errorf("%w: dial: %v", sink.ErrSinkUnavailable, err)
 	}
 
 	ch, err := conn.Channel()
 	if err != nil {
-		conn.Close()
-		return fmt.Errorf("opening channel: %w", err)
+		_ = conn.Close()
+		return fmt.Errorf("%w: open channel: %v", sink.ErrSinkUnavailable, err)
 	}
 
 	if err := ch.ExchangeDeclare(
 		s.cfg.Exchange,
-		"topic",
-		true,
-		false,
-		false,
-		false,
-		nil,
+		"topic", // type
+		true,    // durable
+		false,   // auto-delete
+		false,   // internal
+		false,   // no-wait
+		nil,     // args
 	); err != nil {
-		ch.Close()
-		conn.Close()
-		return fmt.Errorf("declaring exchange %q: %w", s.cfg.Exchange, err)
+		_ = ch.Close()
+		_ = conn.Close()
+		return fmt.Errorf("%w: declare exchange %q: %v", sink.ErrSinkUnavailable, s.cfg.Exchange, err)
 	}
 
+	var confirms chan amqp.Confirmation
 	if s.cfg.PublisherConfirms {
 		if err := ch.Confirm(false); err != nil {
-			ch.Close()
-			conn.Close()
-			return fmt.Errorf("enabling publisher confirms: %w", err)
+			_ = ch.Close()
+			_ = conn.Close()
+			return fmt.Errorf("%w: enable confirms: %v", sink.ErrSinkUnavailable, err)
 		}
+		// Buffer of 1 is enough since we serialize Publishes — at most
+		// one confirmation is in flight at a time.
+		confirms = ch.NotifyPublish(make(chan amqp.Confirmation, 1))
 	}
 
 	s.conn = conn
 	s.channel = ch
+	s.confirms = confirms
 	return nil
 }
 
-// Write publishes each non-empty entity category from the buffer as a separate
-// message on the configured exchange.
-func (s *RabbitMQSink) Write(ctx context.Context, buffer sink.LedgerBuffer, ledgerSeq uint32) error {
-	now := time.Now().UTC()
-
-	type batch struct {
-		eventType string
-		payload   interface{}
+// Publish serializes env to JSON, builds its routing key, and publishes
+// to the configured exchange. Behavior depends on PublisherConfirms:
+//
+//   - true (recommended): Publish blocks until either the broker acks
+//     the publish (returns nil), the broker nacks it (returns wrapped
+//     ErrSinkPublishRejected), ctx is cancelled (returns ctx.Err()), or
+//     PublishConfirmTimeout elapses (returns wrapped ErrSinkPublishRejected).
+//   - false: Publish returns as soon as the channel accepts the frame
+//     (at-most-once semantics). Not recommended for production.
+//
+// On a transport-level publish failure (channel closed, network blip),
+// Publish attempts one reconnect-and-retry cycle before propagating the
+// error.
+func (s *RabbitMQSink) Publish(ctx context.Context, env events.Envelope) error {
+	if err := env.Validate(); err != nil {
+		return err
 	}
 
-	batches := []batch{
-		{"escrow", buffer.GetEscrows()},
-		{"state_change", buffer.GetStateChanges()},
-		{"transaction", buffer.GetTransactions()},
-		{"operation", buffer.GetOperations()},
-		{"trustline_change", buffer.GetTrustlineChanges()},
-		{"contract_change", buffer.GetContractChanges()},
+	body, err := json.Marshal(&env)
+	if err != nil {
+		// JSON of our own struct cannot fail unless we changed a field
+		// to something unmarshalable — caller bug.
+		return fmt.Errorf("%w: marshaling envelope: %v", events.ErrEnvelopeInvalid, err)
 	}
 
-	for _, b := range batches {
-		if isEmpty(b.payload) {
-			continue
+	routingKey := BuildRoutingKey(s.cfg.Network, env.EventKind)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.publishLocked(ctx, routingKey, body); err != nil {
+		// Try one reconnect-and-retry. Transient connection blips are
+		// common; we want to absorb them inside a single Publish call
+		// rather than propagate to the loop on every glitch.
+		if reconnErr := s.reconnectLocked(); reconnErr != nil {
+			return reconnErr
 		}
-
-		routingKey := fmt.Sprintf("stellar.%s.%s", s.cfg.Network, b.eventType)
-
-		msg, err := s.marshal(envelope{
-			LedgerSeq: ledgerSeq,
-			Network:   s.cfg.Network,
-			EventType: b.eventType,
-			Timestamp: now,
-			Payload:   b.payload,
-		})
-		if err != nil {
-			return fmt.Errorf("marshaling %s for ledger %d: %w", b.eventType, ledgerSeq, err)
+		if err := s.publishLocked(ctx, routingKey, body); err != nil {
+			return err
 		}
-
-		if err := s.publish(ctx, routingKey, msg); err != nil {
-			// Attempt a single reconnect before giving up
-			logrus.WithError(err).Warnf("rabbitmq: publish failed, attempting reconnect")
-			if reconnErr := s.reconnect(); reconnErr != nil {
-				return fmt.Errorf("rabbitmq: publish failed and reconnect failed: %w", err)
-			}
-			if err := s.publish(ctx, routingKey, msg); err != nil {
-				return fmt.Errorf("rabbitmq: publish failed after reconnect for ledger %d: %w", ledgerSeq, err)
-			}
-		}
-
-		logrus.WithFields(logrus.Fields{
-			"ledger":      ledgerSeq,
-			"routing_key": routingKey,
-		}).Debug("rabbitmq: published message")
 	}
+
+	logrus.WithFields(logrus.Fields{
+		"ledger_seq":  env.LedgerSeq,
+		"event_kind":  env.EventKind,
+		"contract_id": env.ContractID,
+		"message_id":  env.MessageID,
+		"routing_key": routingKey,
+		"component":   "sink.rabbitmq",
+	}).Debug("envelope published")
 
 	return nil
 }
 
-func (s *RabbitMQSink) publish(ctx context.Context, routingKey string, body []byte) error {
-	return s.channel.PublishWithContext(
+// publishLocked publishes the body and, if confirms are enabled, awaits
+// the confirmation. Caller must hold s.mu.
+func (s *RabbitMQSink) publishLocked(ctx context.Context, routingKey string, body []byte) error {
+	err := s.channel.PublishWithContext(
 		ctx,
-		s.cfg.Exchange, // exchange
-		routingKey,     // routing key
-		false,          // mandatory
-		false,          // immediate
+		s.cfg.Exchange,
+		routingKey,
+		false, // mandatory
+		false, // immediate
 		amqp.Publishing{
 			ContentType:  "application/json",
 			DeliveryMode: amqp.Persistent,
+			Timestamp:    time.Now().UTC(),
 			Body:         body,
 		},
 	)
-}
-
-func (s *RabbitMQSink) marshal(v interface{}) ([]byte, error) {
-	return json.Marshal(v)
-}
-
-// reconnect closes the existing connection (best effort) and re-establishes it
-// with a simple retry using exponential backoff up to 5 attempts.
-func (s *RabbitMQSink) reconnect() error {
-	if s.channel != nil {
-		s.channel.Close()
-	}
-	if s.conn != nil {
-		s.conn.Close()
+	if err != nil {
+		return fmt.Errorf("%w: publish %q: %v", sink.ErrSinkUnavailable, routingKey, err)
 	}
 
+	if !s.cfg.PublisherConfirms {
+		return nil
+	}
+	return s.awaitConfirmLocked(ctx)
+}
+
+// awaitConfirmLocked waits for the next publisher confirmation. Returns
+// nil on a positive ack; a wrapped ErrSinkPublishRejected on Nack, on a
+// closed confirm channel, or on timeout. Caller must hold s.mu.
+func (s *RabbitMQSink) awaitConfirmLocked(ctx context.Context) error {
+	select {
+	case c, ok := <-s.confirms:
+		if !ok {
+			return fmt.Errorf("%w: confirm channel closed", sink.ErrSinkUnavailable)
+		}
+		if !c.Ack {
+			return fmt.Errorf("%w: broker nacked delivery tag %d", sink.ErrSinkPublishRejected, c.DeliveryTag)
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(s.cfg.PublishConfirmTimeout):
+		return fmt.Errorf("%w: timeout after %v waiting for publisher confirm", sink.ErrSinkPublishRejected, s.cfg.PublishConfirmTimeout)
+	}
+}
+
+// reconnectLocked tears down the current AMQP session (best-effort) and
+// dials a fresh one. Returns a wrapped ErrSinkUnavailable if all attempts
+// fail. Caller must hold s.mu.
+func (s *RabbitMQSink) reconnectLocked() error {
+	s.closeLocked()
+
+	var lastErr error
 	backoff := time.Second
-	for attempt := 1; attempt <= 5; attempt++ {
-		logrus.WithField("attempt", attempt).Info("rabbitmq: reconnecting...")
+	for attempt := 1; attempt <= reconnectMaxAttempts; attempt++ {
 		if err := s.connect(); err == nil {
-			logrus.Info("rabbitmq: reconnected successfully")
+			logrus.WithField("attempt", attempt).Info("rabbitmq: reconnected")
 			return nil
+		} else {
+			lastErr = err
+			logrus.WithError(err).WithField("attempt", attempt).Warn("rabbitmq: reconnect attempt failed")
 		}
 		time.Sleep(backoff)
 		if backoff < 30*time.Second {
 			backoff *= 2
 		}
 	}
-	return fmt.Errorf("rabbitmq: failed to reconnect after 5 attempts")
+	return fmt.Errorf("%w: reconnect failed after %d attempts: %v", sink.ErrSinkUnavailable, reconnectMaxAttempts, lastErr)
 }
 
-// Ping verifies the connection is alive. Implements sink.HealthChecker.
-func (s *RabbitMQSink) Ping(_ context.Context) error {
-	if s.conn == nil || s.conn.IsClosed() {
-		return fmt.Errorf("rabbitmq: connection is closed")
-	}
-	return nil
-}
-
-func (s *RabbitMQSink) Close() error {
+// closeLocked closes the channel and connection, ignoring errors (we're
+// already in an error path; best-effort is the right policy).
+func (s *RabbitMQSink) closeLocked() {
 	if s.channel != nil {
-		s.channel.Close()
+		_ = s.channel.Close()
+		s.channel = nil
 	}
 	if s.conn != nil {
-		return s.conn.Close()
+		_ = s.conn.Close()
+		s.conn = nil
+	}
+	s.confirms = nil
+}
+
+// Ping reports liveness for /readyz. Cheap: only inspects the cached
+// connection state, no network call. A broken connection is detected on
+// the next Publish via the standard reconnect path.
+func (s *RabbitMQSink) Ping(_ context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conn == nil || s.conn.IsClosed() {
+		return fmt.Errorf("%w: connection closed", sink.ErrSinkUnavailable)
 	}
 	return nil
 }
 
-// isEmpty reports whether v is a nil or zero-length slice.
-func isEmpty(v interface{}) bool {
-	if v == nil {
-		return true
+// Close closes the channel and connection. Safe to call multiple times.
+// After Close, Publish will fail with ErrSinkUnavailable.
+func (s *RabbitMQSink) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var firstErr error
+	if s.channel != nil {
+		if err := s.channel.Close(); err != nil && !errors.Is(err, amqp.ErrClosed) {
+			firstErr = fmt.Errorf("closing channel: %w", err)
+		}
+		s.channel = nil
 	}
-	rv := reflect.ValueOf(v)
-	if rv.Kind() == reflect.Slice {
-		return rv.Len() == 0
+	if s.conn != nil {
+		if err := s.conn.Close(); err != nil && !errors.Is(err, amqp.ErrClosed) {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("closing connection: %w", err)
+			}
+		}
+		s.conn = nil
 	}
-	return false
+	s.confirms = nil
+	return firstErr
+}
+
+// BuildRoutingKey returns the AMQP topic key the Indexer publishes to
+// for a given network and event_kind. Exposed so tests and the factory
+// can compute the expected routing key without duplicating the
+// formatting rule.
+//
+// Format: "stellar.<network>.escrow.<event_kind>".
+func BuildRoutingKey(network string, eventKind string) string {
+	return fmt.Sprintf("stellar.%s.escrow.%s", network, eventKind)
 }

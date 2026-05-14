@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/Trustless-Work/Indexer/internal/events"
+	"github.com/Trustless-Work/Indexer/internal/rpc"
+	"github.com/Trustless-Work/Indexer/internal/sink"
 	"github.com/Trustless-Work/Indexer/internal/state"
 )
 
@@ -67,22 +69,80 @@ func TestIsSkippable_RejectsFatal(t *testing.T) {
 	}
 }
 
-func TestIsTransient_Phase1IsEmpty(t *testing.T) {
-	// Phase 1 invariant: nothing is transient until Phase 2 adds RPC/sink
-	// sentinels. This test pins the invariant so a future change is
-	// forced to update the contract intentionally.
+func TestIsTransient_MatchesRPCAndSink(t *testing.T) {
+	cases := []error{
+		rpc.ErrLedgerNotYetAvailable,
+		rpc.ErrRPCUnreachable,
+		rpc.ErrRPCInvalidResponse,
+		sink.ErrSinkUnavailable,
+		sink.ErrSinkPublishRejected,
+	}
+	for _, e := range cases {
+		t.Run(e.Error(), func(t *testing.T) {
+			if !IsTransient(e) {
+				t.Errorf("expected transient: %v", e)
+			}
+		})
+	}
+}
+
+func TestIsTransient_RejectsNonTransient(t *testing.T) {
+	// Errors that belong to fatal/skippable/clean-shutdown categories
+	// must NOT be reported as transient.
 	cases := []error{
 		nil,
 		errors.New("random"),
 		events.ErrUnknownTopic,
-		events.ErrXDRDecodingFail,
-		events.ErrEnvelopeInvalid,
-		state.ErrStateNotFound,
-		state.ErrStateCorrupted,
+		events.ErrXDRDecodingFail,    // skippable
+		events.ErrEnvelopeInvalid,    // fatal
+		state.ErrStateNotFound,        // recovered via bootstrap, not retry
+		state.ErrStateCorrupted,       // fatal
+		rpc.ErrLedgerOutOfRetention,   // fatal
 	}
 	for _, e := range cases {
 		if IsTransient(e) {
-			t.Errorf("Phase 1: nothing must be transient yet; got true for %v", e)
+			t.Errorf("must not be transient: %v", e)
+		}
+	}
+}
+
+func TestIsFatal_MatchesLedgerOutOfRetention(t *testing.T) {
+	if !IsFatal(rpc.ErrLedgerOutOfRetention) {
+		t.Fatal("ErrLedgerOutOfRetention must be fatal")
+	}
+}
+
+func TestCategories_AreDisjoint(t *testing.T) {
+	// Spot-check: no sentinel should match more than one of the three
+	// predicates. (Context errors are handled separately and should
+	// match none.)
+	all := []error{
+		state.ErrStateCorrupted,
+		state.ErrStateVersionMismatch,
+		state.ErrStateNetworkMismatch,
+		state.ErrStateLockHeld,
+		rpc.ErrLedgerOutOfRetention,
+		rpc.ErrLedgerNotYetAvailable,
+		rpc.ErrRPCUnreachable,
+		rpc.ErrRPCInvalidResponse,
+		sink.ErrSinkUnavailable,
+		sink.ErrSinkPublishRejected,
+		events.ErrEnvelopeInvalid,
+		events.ErrXDRDecodingFail,
+	}
+	for _, e := range all {
+		count := 0
+		if IsTransient(e) {
+			count++
+		}
+		if IsFatal(e) {
+			count++
+		}
+		if IsSkippable(e) {
+			count++
+		}
+		if count != 1 {
+			t.Errorf("sentinel %v classified by %d predicates; want exactly 1", e, count)
 		}
 	}
 }

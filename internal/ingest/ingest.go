@@ -7,9 +7,6 @@ import (
 	"time"
 
 	"github.com/Trustless-Work/Indexer/internal/services"
-	"github.com/Trustless-Work/Indexer/internal/sink"
-	sinkfactory "github.com/Trustless-Work/Indexer/internal/sink/factory"
-	"github.com/Trustless-Work/Indexer/internal/utils"
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
 	"github.com/stellar/go-stellar-sdk/support/log"
 )
@@ -62,19 +59,16 @@ type Config struct {
 }
 
 // Ingest runs the ingestion pipeline using the provided context for
-// cancellation. It instantiates the sink from the environment, runs the loop,
-// and ensures the sink is closed on return.
+// cancellation. The caller is responsible for cancelling ctx (e.g. on
+// SIGTERM) to trigger graceful shutdown.
 //
-// The caller is responsible for cancelling ctx (e.g. on SIGTERM) to trigger a
-// graceful shutdown.
+// NOTE (Phase 2 of overhaul, 2026-05-13): sink wiring was removed
+// because the Sink interface switched to a per-envelope contract. The
+// new Publisher path that walks the processed buffer, builds Envelopes
+// and calls sink.Publish lives in the next phase of the overhaul. Until
+// then this function processes ledgers without emitting anything.
 func Ingest(ctx context.Context, cfg Config) error {
-	outSink, err := sinkfactory.NewFromEnv()
-	if err != nil {
-		return fmt.Errorf("building sink: %w", err)
-	}
-	defer utils.DeferredClose(ctx, outSink, "closing sink")
-
-	ingestService, err := setupDeps(ctx, cfg, outSink)
+	ingestService, err := setupDeps(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("setting up dependencies: %w", err)
 	}
@@ -89,7 +83,7 @@ func Ingest(ctx context.Context, cfg Config) error {
 	return nil
 }
 
-func setupDeps(ctx context.Context, cfg Config, outSink sink.Sink) (services.IngestService, error) {
+func setupDeps(ctx context.Context, cfg Config) (services.IngestService, error) {
 	httpClient := &http.Client{Timeout: httpClientTimeout}
 
 	rpcService, err := services.NewRPCService(cfg.RPCURL, cfg.NetworkPassphrase, httpClient)
@@ -115,7 +109,6 @@ func setupDeps(ctx context.Context, cfg Config, outSink sink.Sink) (services.Ing
 		RPCService:                 rpcService,
 		LedgerBackend:              ledgerBackend,
 		LedgerBackendFactory:       ledgerBackendFactory,
-		Sink:                       outSink,
 		GetLedgersLimit:            cfg.GetLedgersLimit,
 		Network:                    cfg.Network,
 		NetworkPassphrase:          cfg.NetworkPassphrase,

@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/Trustless-Work/Indexer/internal/indexer"
-	"github.com/Trustless-Work/Indexer/internal/sink"
 	"github.com/Trustless-Work/Indexer/internal/utils"
 	"github.com/alitto/pond/v2"
 	"github.com/stellar/go-stellar-sdk/historyarchive"
@@ -53,8 +52,10 @@ type IngestServiceConfig struct {
 	LedgerBackendFactory LedgerBackendFactory
 
 	// === Output ===
-	// Sink receives the processed buffer for every ledger. Required.
-	Sink sink.Sink
+	// NOTE (Phase 2 of overhaul, 2026-05-13): the sink field was
+	// removed. Sink emission is now per-envelope via a new Publisher
+	// abstraction that will be wired in the next overhaul phase. Until
+	// then this service processes ledgers and discards the buffer.
 
 	// === Cursors ===
 	LatestLedgerCursorName string
@@ -86,7 +87,6 @@ type ingestService struct {
 	networkPassphrase    string
 	getLedgersLimit      int
 	ledgerIndexer        *indexer.Indexer
-	sink                 sink.Sink
 }
 
 func NewIngestService(cfg IngestServiceConfig) (*ingestService, error) {
@@ -95,9 +95,6 @@ func NewIngestService(cfg IngestServiceConfig) (*ingestService, error) {
 	}
 	if cfg.LedgerBackend == nil {
 		return nil, errors.New("ledger backend is required")
-	}
-	if cfg.Sink == nil {
-		return nil, errors.New("sink is required")
 	}
 
 	// Create worker pool for the ledger indexer (parallel transaction processing within a ledger)
@@ -110,7 +107,6 @@ func NewIngestService(cfg IngestServiceConfig) (*ingestService, error) {
 		networkPassphrase:    cfg.NetworkPassphrase,
 		getLedgersLimit:      cfg.GetLedgersLimit,
 		ledgerIndexer:        indexer.NewIndexer(cfg.NetworkPassphrase, ledgerIndexerPool, cfg.SkipTxMeta, cfg.SkipTxEnvelope),
-		sink:                 cfg.Sink,
 	}, nil
 }
 
@@ -208,10 +204,18 @@ func (m *ingestService) prepareBackendRange(ctx context.Context, startLedger, en
 	return nil
 }
 
-// processLedger processes a single ledger through all ingestion phases.
+// processLedger processes a single ledger through the ingestion phases.
 // Phase 1: Get transactions from ledger
 // Phase 2: Process transactions using Indexer (parallel within ledger)
-// Phase 3: Hand the processed buffer to the configured Sink
+//
+// NOTE (Phase 2 of overhaul, 2026-05-13): the previous Phase 3 ("hand
+// the buffer to the sink") was removed because the sink interface
+// switched to a per-envelope contract (sink.Sink.Publish). The new
+// publisher path that walks the buffer, builds Envelopes and calls
+// Publish lives in Phase 3 of the overhaul. Until then this function
+// processes a ledger and discards the buffer — same behavior the
+// pipeline had before Sprint 1's wiring. The cursor stays in lock-step
+// with this no-op while the new path is being built.
 func (m *ingestService) processLedger(ctx context.Context, ledgerMeta xdr.LedgerCloseMeta) error {
 	ledgerSeq := ledgerMeta.LedgerSequence()
 
@@ -221,16 +225,14 @@ func (m *ingestService) processLedger(ctx context.Context, ledgerMeta xdr.Ledger
 		return fmt.Errorf("getting transactions for ledger %d: %w", ledgerSeq, err)
 	}
 
-	// Phase 2: Process transactions using Indexer (parallel within ledger)
+	// Phase 2: Process transactions using Indexer (parallel within ledger).
+	// The buffer is populated but intentionally discarded until the new
+	// Publisher is wired up in the next phase of the overhaul.
 	buffer := indexer.NewIndexerBuffer()
 	if _, err := m.ledgerIndexer.ProcessLedgerTransactions(ctx, transactions, buffer); err != nil {
 		return fmt.Errorf("processing transactions for ledger %d: %w", ledgerSeq, err)
 	}
-
-	// Phase 3: Hand the buffer to the configured sink.
-	if err := m.sink.Write(ctx, buffer, ledgerSeq); err != nil {
-		return fmt.Errorf("writing ledger %d to sink: %w", ledgerSeq, err)
-	}
+	_ = buffer
 
 	return nil
 }

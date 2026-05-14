@@ -1,21 +1,26 @@
-// Package factory builds Sink implementations from environment configuration.
-// It is intentionally separate from the internal/sink package to keep the
-// Sink interface and its concrete implementations free of import cycles.
+// Package factory builds Sink implementations from validated configuration.
+// It lives outside internal/sink to break the import cycle that would
+// otherwise form between the sink interface package and its concrete
+// implementations (each of which imports sink).
+//
+// The factory does not read environment variables directly — that is the
+// responsibility of internal/config. The factory takes a typed config
+// value, dispatches on Sink.Type, and constructs the appropriate
+// implementation. This keeps env-handling in one place (internal/config)
+// and makes the sink layer easy to test with hand-built config values.
 package factory
 
 import (
 	"fmt"
-	"os"
-	"strconv"
-	"strings"
 
+	"github.com/Trustless-Work/Indexer/internal/config"
 	"github.com/Trustless-Work/Indexer/internal/sink"
 	"github.com/Trustless-Work/Indexer/internal/sink/noop"
 	"github.com/Trustless-Work/Indexer/internal/sink/rabbitmq"
 )
 
-// Type identifies a concrete sink implementation. It is loaded from the
-// SINK_TYPE environment variable.
+// Type identifies a concrete sink implementation. Its values match the
+// case-insensitive strings accepted by SinkConfig.Type.
 type Type string
 
 const (
@@ -23,75 +28,32 @@ const (
 	TypeRabbitMQ Type = "rabbitmq"
 )
 
-// EnvSinkType is the name of the environment variable that selects the sink
-// implementation. Defaults to TypeNoop when unset or empty.
-const EnvSinkType = "SINK_TYPE"
-
-// NewFromEnv builds a Sink based on the SINK_TYPE environment variable.
-// Backend-specific configuration is also read from the environment by each
-// implementation. Returns TypeNoop when SINK_TYPE is unset.
+// New constructs a Sink based on cfg. The Network is read separately so
+// the sink can build correct routing keys without needing access to the
+// full Config tree.
 //
-// Supported values (case-insensitive): "noop", "rabbitmq".
-func NewFromEnv() (sink.Sink, error) {
-	raw := strings.ToLower(strings.TrimSpace(os.Getenv(EnvSinkType)))
-	if raw == "" {
-		raw = string(TypeNoop)
+// New does not perform a second-pass validation of cfg — Config.Validate
+// has already enforced the cross-field rules. New does perform the
+// minimal "is the URL non-empty" check the implementations require, so
+// a caller who builds a Config by hand (e.g. tests) still gets a clear
+// error.
+func New(cfg *config.Config) (sink.Sink, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("sink factory: config is nil")
 	}
 
-	switch Type(raw) {
+	switch Type(cfg.Sink.Type) {
 	case TypeNoop:
 		return noop.New(), nil
 	case TypeRabbitMQ:
-		cfg, err := rabbitMQConfigFromEnv()
-		if err != nil {
-			return nil, fmt.Errorf("loading rabbitmq config: %w", err)
-		}
-		return rabbitmq.New(cfg)
+		return rabbitmq.New(rabbitmq.Config{
+			URL:               cfg.RabbitMQ.URL,
+			Exchange:          cfg.RabbitMQ.Exchange,
+			Network:           cfg.Network.Name,
+			PublisherConfirms: cfg.RabbitMQ.PublisherConfirms,
+		})
 	default:
-		return nil, fmt.Errorf("unsupported sink type %q (expected one of: %s, %s)", raw, TypeNoop, TypeRabbitMQ)
+		return nil, fmt.Errorf("sink factory: unsupported sink type %q (expected one of: %s, %s)",
+			cfg.Sink.Type, TypeNoop, TypeRabbitMQ)
 	}
-}
-
-// RabbitMQ-specific environment variables.
-const (
-	EnvRabbitMQURL                = "RABBITMQ_URL"
-	EnvRabbitMQExchange           = "RABBITMQ_EXCHANGE"
-	EnvRabbitMQNetwork            = "RABBITMQ_NETWORK"
-	EnvRabbitMQPublisherConfirms  = "RABBITMQ_PUBLISHER_CONFIRMS"
-	defaultRabbitMQExchange       = "stellar.events"
-	defaultRabbitMQNetwork        = "testnet"
-)
-
-// rabbitMQConfigFromEnv loads RabbitMQSink configuration from the environment.
-// RABBITMQ_URL is required. The remaining variables have sensible defaults.
-func rabbitMQConfigFromEnv() (rabbitmq.Config, error) {
-	url := strings.TrimSpace(os.Getenv(EnvRabbitMQURL))
-	if url == "" {
-		return rabbitmq.Config{}, fmt.Errorf("%s is required when SINK_TYPE=rabbitmq", EnvRabbitMQURL)
-	}
-
-	cfg := rabbitmq.Config{
-		URL:      url,
-		Exchange: getenvDefault(EnvRabbitMQExchange, defaultRabbitMQExchange),
-		Network:  getenvDefault(EnvRabbitMQNetwork, defaultRabbitMQNetwork),
-	}
-
-	if v := strings.TrimSpace(os.Getenv(EnvRabbitMQPublisherConfirms)); v != "" {
-		parsed, err := strconv.ParseBool(v)
-		if err != nil {
-			return rabbitmq.Config{}, fmt.Errorf("parsing %s=%q as bool: %w", EnvRabbitMQPublisherConfirms, v, err)
-		}
-		cfg.PublisherConfirms = parsed
-	}
-
-	return cfg, nil
-}
-
-// getenvDefault returns the trimmed value of the environment variable name, or
-// def when the variable is unset or empty.
-func getenvDefault(name, def string) string {
-	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
-		return v
-	}
-	return def
 }
