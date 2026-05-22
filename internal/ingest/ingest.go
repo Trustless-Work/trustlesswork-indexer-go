@@ -69,6 +69,17 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 	startLedger := cfg.Indexer.StartLedger
 	endLedger := cfg.Indexer.EndLedger
 
+	// START_LEDGER unset (0) means "start from the network tip". Resolve it
+	// from the backend, since the RPC rejects a PrepareRange starting at 0.
+	if startLedger == 0 {
+		tip, err := backend.GetLatestLedgerSequence(ctx)
+		if err != nil {
+			return fmt.Errorf("resolving latest ledger from backend: %w", err)
+		}
+		log.Ctx(ctx).Infof("START_LEDGER unset; starting from network tip %d", tip)
+		startLedger = tip
+	}
+
 	if err := prepareBackendRange(ctx, backend, startLedger, endLedger); err != nil {
 		return fmt.Errorf("preparing backend range: %w", err)
 	}
