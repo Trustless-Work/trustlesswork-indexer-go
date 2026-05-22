@@ -24,6 +24,7 @@ import (
 
 	"github.com/Trustless-Work/Indexer/internal/config"
 	"github.com/Trustless-Work/Indexer/internal/indexer"
+	"github.com/Trustless-Work/Indexer/internal/indexer/registry"
 	"github.com/Trustless-Work/Indexer/internal/utils"
 	"github.com/alitto/pond/v2"
 	sdkingest "github.com/stellar/go-stellar-sdk/ingest"
@@ -71,12 +72,19 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("preparing backend range: %w", err)
 	}
 
+	// Escrow registry: identifies "our" contracts by approved WASM hash.
+	// Populated by the discovery pass (and, later, an API seed).
+	reg, err := registry.New(cfg.Escrow.ApprovedWasmHashes)
+	if err != nil {
+		return fmt.Errorf("building escrow registry: %w", err)
+	}
+
 	// Worker pool for parallel transaction processing within a ledger.
 	// Size 0 lets pond size itself from GOMAXPROCS.
 	pool := pond.NewPool(0)
 	defer pool.StopAndWait()
 
-	ledgerIndexer := indexer.NewIndexer(cfg.Network.Passphrase, pool, false, false)
+	ledgerIndexer := indexer.NewIndexer(cfg.Network.Passphrase, reg, pool, false, false)
 
 	currentLedger := startLedger
 	log.Ctx(ctx).Infof("Starting ingestion loop from ledger %d (end=%d)", startLedger, endLedger)
@@ -99,11 +107,12 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 		}
 
 		log.Ctx(ctx).Infof(
-			"Processed ledger %d in %v — txs=%d ops=%d state_changes=%d escrows=%d trustline_changes=%d contract_changes=%d",
+			"Processed ledger %d in %v — txs=%d ops=%d state_changes=%d buf_escrows=%d trustline_changes=%d contract_changes=%d known_escrows=%d",
 			currentLedger, time.Since(started),
 			buffer.GetNumberOfTransactions(), buffer.GetNumberOfOperations(),
 			len(buffer.GetStateChanges()), len(buffer.GetEscrows()),
 			len(buffer.GetTrustlineChanges()), len(buffer.GetContractChanges()),
+			reg.Size(),
 		)
 
 		currentLedger++

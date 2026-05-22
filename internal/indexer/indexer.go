@@ -9,6 +9,7 @@ import (
 
 	"github.com/Trustless-Work/Indexer/internal/entities"
 	"github.com/Trustless-Work/Indexer/internal/indexer/processors"
+	"github.com/Trustless-Work/Indexer/internal/indexer/registry"
 	"github.com/Trustless-Work/Indexer/internal/indexer/types"
 	"github.com/alitto/pond/v2"
 	"github.com/stellar/go-stellar-sdk/support/log"
@@ -66,6 +67,7 @@ type OperationProcessorInterface interface {
 }
 
 type Indexer struct {
+	discovery              *processors.EscrowDiscovery
 	participantsProcessor  ParticipantsProcessorInterface
 	tokenTransferProcessor TokenTransferProcessorInterface
 	escrowProcessor        EscrowProcessorInterface
@@ -76,8 +78,9 @@ type Indexer struct {
 	networkPassphrase      string
 }
 
-func NewIndexer(networkPassphrase string, pool pond.Pool, skipTxMeta bool, skipTxEnvelope bool) *Indexer {
+func NewIndexer(networkPassphrase string, reg *registry.Registry, pool pond.Pool, skipTxMeta bool, skipTxEnvelope bool) *Indexer {
 	return &Indexer{
+		discovery:              processors.NewEscrowDiscovery(reg),
 		participantsProcessor:  processors.NewParticipantsProcessor(networkPassphrase),
 		tokenTransferProcessor: processors.NewTokenTransferProcessor(networkPassphrase),
 		escrowProcessor:        contract_processors.NewEscrowProcessor(networkPassphrase),
@@ -92,10 +95,27 @@ func NewIndexer(networkPassphrase string, pool pond.Pool, skipTxMeta bool, skipT
 	}
 }
 
-// ProcessLedgerTransactions processes all transactions in a ledger in parallel.
-// It collects transaction data (participants, operations, state changes) and populates the buffer in a single pass.
+// ProcessLedgerTransactions processes all transactions in a ledger.
+//
+// Pass 1 (sequential): escrow discovery. Every transaction's ledger-entry
+// changes are scanned for contract instances with an approved WASM hash,
+// registering them before any consumption. This ordering matters: a
+// factory deploy and the first event/deposit to that new escrow can land
+// in the same ledger, and the consumers must already know the escrow.
+//
+// Pass 2 (parallel): the per-transaction processors collect participants,
+// operations and state changes into the buffer.
+//
 // Returns the total participant count for metrics.
 func (i *Indexer) ProcessLedgerTransactions(ctx context.Context, transactions []ingest.LedgerTransaction, ledgerBuffer IndexerBufferInterface) (int, error) {
+	// Pass 1: discovery (registers approved-hash escrows).
+	for _, tx := range transactions {
+		if _, err := i.discovery.DiscoverFromTransaction(tx); err != nil {
+			return 0, fmt.Errorf("escrow discovery at ledger=%d tx=%d: %w", tx.Ledger.LedgerSequence(), tx.Index, err)
+		}
+	}
+
+	// Pass 2: parallel per-transaction processing.
 	group := i.pool.NewGroupContext(ctx)
 
 	txnBuffers := make([]*IndexerBuffer, len(transactions))
