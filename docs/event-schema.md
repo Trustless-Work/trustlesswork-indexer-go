@@ -4,12 +4,22 @@ This document is the canonical specification of the messages the Indexer
 publishes to RabbitMQ. It is the contract that consumers — primarily the
 Trustless Work NestJS API — rely on to build their views.
 
-> **Status (2026-05-21):** this is the **target** wire contract the
-> processor pipeline is being built toward. The repository currently
-> sits at a clean processor-core base that does not yet publish; this
-> document defines the shape that delivery will take. It is the
-> reference both the Indexer and the API code against while the
-> processors and sink are implemented.
+> **Status (updated 2026-05-21):** this is the **target** wire contract the
+> processor pipeline is being built toward; the Indexer does not publish
+> yet. Both the Indexer and the consuming API code against this shape.
+>
+> **Implemented so far:** escrow identity by approved WASM hash
+> (`internal/indexer/registry` + `ESCROW_APPROVED_WASM_HASHES`); on-chain
+> discovery of escrows (`processors.EscrowDiscovery`); and registry-filtered
+> detection of `event`/`deposit` facts (`processors.EscrowEventDetector`,
+> type `EscrowEvent`). Those facts already carry the envelope's identity,
+> kind, index, tx-order and raw-XDR fields.
+>
+> **Pending (resume here):** the `state` stream (ContractData snapshots via
+> `LedgerTransaction.GetChanges()`); serialising `EscrowEvent` facts into the
+> JSON envelope below (incl. `message_id`, `schema_version`); the RabbitMQ
+> sink + routing keys + publisher confirms; and escrow bootstrap (API seed +
+> `getLedgerEntries` fallback for escrows created before the indexed range).
 
 ## Design principles
 
