@@ -28,6 +28,7 @@ type Config struct {
 	Network   NetworkConfig   `envPrefix:"NETWORK_"`
 	RPC       RPCConfig       `envPrefix:"RPC_"`
 	Indexer   IndexerConfig   `envPrefix:"INDEXER_"`
+	Escrow    EscrowConfig    `envPrefix:"ESCROW_"`
 	Sink      SinkConfig      `envPrefix:"SINK_"`
 	RabbitMQ  RabbitMQConfig  `envPrefix:"RABBITMQ_"`
 	State     StateConfig     `envPrefix:"STATE_"`
@@ -90,6 +91,18 @@ type IndexerConfig struct {
 	// false (keep everything).
 	SkipTxMeta     bool `env:"SKIP_TX_META"`
 	SkipTxEnvelope bool `env:"SKIP_TX_ENVELOPE"`
+}
+
+// EscrowConfig declares which contracts count as TW escrows. A contract
+// is recognised as an escrow when its WASM code hash is in
+// ApprovedWasmHashes — one hash per published contract version. Adding a
+// new contract version is a config change here, not a code change.
+type EscrowConfig struct {
+	// ApprovedWasmHashes is the set of approved escrow code hashes, each
+	// a 32-byte hex string, comma-separated in the env var
+	// (ESCROW_APPROVED_WASM_HASHES). May be empty in dev; the registry
+	// then recognises escrows only via seed.
+	ApprovedWasmHashes []string `env:"APPROVED_WASM_HASHES" envSeparator:","`
 }
 
 // SinkConfig selects which transport receives envelopes. Concrete sink

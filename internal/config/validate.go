@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -71,6 +72,17 @@ func (c *Config) Validate() error {
 	}
 	if _, ok := validLedgerBackendTypes[c.Indexer.LedgerBackendType]; !ok {
 		errs = append(errs, fmt.Errorf("INDEXER_LEDGER_BACKEND_TYPE must be one of [rpc datastore]; got %q", c.Indexer.LedgerBackendType))
+	}
+
+	// --- Escrow identity ---
+	for _, h := range c.Escrow.ApprovedWasmHashes {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			continue
+		}
+		if b, err := hex.DecodeString(h); err != nil || len(b) != 32 {
+			errs = append(errs, fmt.Errorf("ESCROW_APPROVED_WASM_HASHES entries must be 32-byte hex strings; got %q", h))
+		}
 	}
 
 	// --- Sink + cross-deps ---
