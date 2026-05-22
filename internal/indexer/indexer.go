@@ -68,6 +68,7 @@ type OperationProcessorInterface interface {
 
 type Indexer struct {
 	discovery              *processors.EscrowDiscovery
+	eventDetector          *processors.EscrowEventDetector
 	participantsProcessor  ParticipantsProcessorInterface
 	tokenTransferProcessor TokenTransferProcessorInterface
 	escrowProcessor        EscrowProcessorInterface
@@ -81,6 +82,7 @@ type Indexer struct {
 func NewIndexer(networkPassphrase string, reg *registry.Registry, pool pond.Pool, skipTxMeta bool, skipTxEnvelope bool) *Indexer {
 	return &Indexer{
 		discovery:              processors.NewEscrowDiscovery(reg),
+		eventDetector:          processors.NewEscrowEventDetector(reg),
 		participantsProcessor:  processors.NewParticipantsProcessor(networkPassphrase),
 		tokenTransferProcessor: processors.NewTokenTransferProcessor(networkPassphrase),
 		escrowProcessor:        contract_processors.NewEscrowProcessor(networkPassphrase),
@@ -106,12 +108,15 @@ func NewIndexer(networkPassphrase string, reg *registry.Registry, pool pond.Pool
 // Pass 2 (parallel): the per-transaction processors collect participants,
 // operations and state changes into the buffer.
 //
-// Returns the total participant count for metrics.
-func (i *Indexer) ProcessLedgerTransactions(ctx context.Context, transactions []ingest.LedgerTransaction, ledgerBuffer IndexerBufferInterface) (int, error) {
+// Pass 3 (sequential): escrow event/deposit detection against the
+// now-populated registry; the detected facts are returned for publishing.
+//
+// Returns the detected escrow events and the total participant count.
+func (i *Indexer) ProcessLedgerTransactions(ctx context.Context, transactions []ingest.LedgerTransaction, ledgerBuffer IndexerBufferInterface) ([]processors.EscrowEvent, int, error) {
 	// Pass 1: discovery (registers approved-hash escrows).
 	for _, tx := range transactions {
 		if _, err := i.discovery.DiscoverFromTransaction(tx); err != nil {
-			return 0, fmt.Errorf("escrow discovery at ledger=%d tx=%d: %w", tx.Ledger.LedgerSequence(), tx.Index, err)
+			return nil, 0, fmt.Errorf("escrow discovery at ledger=%d tx=%d: %w", tx.Ledger.LedgerSequence(), tx.Index, err)
 		}
 	}
 
@@ -141,10 +146,10 @@ func (i *Indexer) ProcessLedgerTransactions(ctx context.Context, transactions []
 	}
 
 	if err := group.Wait(); err != nil {
-		return 0, fmt.Errorf("waiting for transaction processing: %w", err)
+		return nil, 0, fmt.Errorf("waiting for transaction processing: %w", err)
 	}
 	if len(errs) > 0 {
-		return 0, fmt.Errorf("processing transactions: %w", errors.Join(errs...))
+		return nil, 0, fmt.Errorf("processing transactions: %w", errors.Join(errs...))
 	}
 
 	// Merge buffers and count participants
@@ -154,7 +159,19 @@ func (i *Indexer) ProcessLedgerTransactions(ctx context.Context, transactions []
 		totalParticipants += participantCounts[idx]
 	}
 
-	return totalParticipants, nil
+	// Pass 3: detect escrow events/deposits. The registry was populated
+	// in pass 1, so IsEscrow lookups are complete. Sequential and
+	// read-only; cheap relative to the structural pass.
+	var events []processors.EscrowEvent
+	for _, tx := range transactions {
+		evs, err := i.eventDetector.DetectFromTransaction(tx)
+		if err != nil {
+			return nil, 0, fmt.Errorf("detecting escrow events at ledger=%d tx=%d: %w", tx.Ledger.LedgerSequence(), tx.Index, err)
+		}
+		events = append(events, evs...)
+	}
+
+	return events, totalParticipants, nil
 }
 
 func (i *Indexer) processTransaction(ctx context.Context, tx ingest.LedgerTransaction, buffer *IndexerBuffer) (int, error) {

@@ -24,6 +24,7 @@ import (
 
 	"github.com/Trustless-Work/Indexer/internal/config"
 	"github.com/Trustless-Work/Indexer/internal/indexer"
+	"github.com/Trustless-Work/Indexer/internal/indexer/processors"
 	"github.com/Trustless-Work/Indexer/internal/indexer/registry"
 	"github.com/Trustless-Work/Indexer/internal/utils"
 	"github.com/alitto/pond/v2"
@@ -101,18 +102,18 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 		}
 
 		started := time.Now()
-		buffer, err := processLedger(ctx, ledgerIndexer, cfg.Network.Passphrase, cfg.Indexer.GetLedgersLimit, meta)
+		buffer, events, err := processLedger(ctx, ledgerIndexer, cfg.Network.Passphrase, cfg.Indexer.GetLedgersLimit, meta)
 		if err != nil {
 			return fmt.Errorf("processing ledger %d: %w", currentLedger, err)
 		}
 
 		log.Ctx(ctx).Infof(
-			"Processed ledger %d in %v — txs=%d ops=%d state_changes=%d buf_escrows=%d trustline_changes=%d contract_changes=%d known_escrows=%d",
+			"Processed ledger %d in %v — txs=%d ops=%d state_changes=%d buf_escrows=%d trustline_changes=%d contract_changes=%d known_escrows=%d escrow_events=%d",
 			currentLedger, time.Since(started),
 			buffer.GetNumberOfTransactions(), buffer.GetNumberOfOperations(),
 			len(buffer.GetStateChanges()), len(buffer.GetEscrows()),
 			len(buffer.GetTrustlineChanges()), len(buffer.GetContractChanges()),
-			reg.Size(),
+			reg.Size(), len(events),
 		)
 
 		currentLedger++
@@ -130,17 +131,18 @@ func processLedger(
 	networkPassphrase string,
 	limitHint int,
 	meta xdr.LedgerCloseMeta,
-) (*indexer.IndexerBuffer, error) {
+) (*indexer.IndexerBuffer, []processors.EscrowEvent, error) {
 	transactions, err := readLedgerTransactions(ctx, networkPassphrase, limitHint, meta)
 	if err != nil {
-		return nil, fmt.Errorf("reading transactions: %w", err)
+		return nil, nil, fmt.Errorf("reading transactions: %w", err)
 	}
 
 	buffer := indexer.NewIndexerBuffer()
-	if _, err := ledgerIndexer.ProcessLedgerTransactions(ctx, transactions, buffer); err != nil {
-		return nil, err
+	events, _, err := ledgerIndexer.ProcessLedgerTransactions(ctx, transactions, buffer)
+	if err != nil {
+		return nil, nil, err
 	}
-	return buffer, nil
+	return buffer, events, nil
 }
 
 // readLedgerTransactions slurps a ledger's transactions into memory using
