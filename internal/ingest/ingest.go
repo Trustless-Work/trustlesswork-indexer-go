@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"time"
 
 	"github.com/Trustless-Work/Indexer/internal/config"
@@ -28,6 +29,7 @@ import (
 	"github.com/Trustless-Work/Indexer/internal/indexer/registry"
 	"github.com/Trustless-Work/Indexer/internal/utils"
 	"github.com/alitto/pond/v2"
+	"github.com/stellar/go-stellar-sdk/clients/rpcclient"
 	sdkingest "github.com/stellar/go-stellar-sdk/ingest"
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
 	"github.com/stellar/go-stellar-sdk/support/log"
@@ -70,14 +72,18 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 	endLedger := cfg.Indexer.EndLedger
 
 	// START_LEDGER unset (0) means "start from the network tip". Resolve it
-	// from the backend, since the RPC rejects a PrepareRange starting at 0.
+	// via a direct RPC call: the RPC rejects a PrepareRange starting at 0,
+	// and the backend's own GetLatestLedgerSequence requires PrepareRange
+	// first (chicken-and-egg), so we ask the RPC straight up.
 	if startLedger == 0 {
-		tip, err := backend.GetLatestLedgerSequence(ctx)
+		rpc := rpcclient.NewClient(cfg.RPC.URL, &http.Client{Timeout: cfg.RPC.RequestTimeout})
+		latest, err := rpc.GetLatestLedger(ctx)
+		_ = rpc.Close()
 		if err != nil {
-			return fmt.Errorf("resolving latest ledger from backend: %w", err)
+			return fmt.Errorf("resolving latest ledger from RPC: %w", err)
 		}
-		log.Ctx(ctx).Infof("START_LEDGER unset; starting from network tip %d", tip)
-		startLedger = tip
+		log.Ctx(ctx).Infof("START_LEDGER unset; starting from network tip %d", latest.Sequence)
+		startLedger = latest.Sequence
 	}
 
 	if err := prepareBackendRange(ctx, backend, startLedger, endLedger); err != nil {
