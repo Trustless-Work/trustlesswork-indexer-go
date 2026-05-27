@@ -16,6 +16,7 @@ package registry
 import (
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -108,6 +109,19 @@ func (r *Registry) Size() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.escrows)
+}
+
+// Snapshot returns the known escrow addresses, sorted for stable diffs
+// across saves. Used to persist the registry to state.
+func (r *Registry) Snapshot() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]string, 0, len(r.escrows))
+	for id := range r.escrows {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ParseHash decodes a 32-byte hex string into an xdr.Hash.

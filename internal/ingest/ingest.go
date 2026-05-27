@@ -85,8 +85,10 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 	startLedger := cfg.Indexer.StartLedger
 	endLedger := cfg.Indexer.EndLedger
 
-	// Resume from the persisted cursor if we have one. A network mismatch
-	// is fatal — the operator must point at the right state file.
+	// Resume from the persisted cursor + escrow set if we have one. A
+	// network mismatch is fatal — point at the right state file.
+	var persistedEscrows []string
+	resumed := false
 	switch loaded, lerr := store.Load(ctx); {
 	case errors.Is(lerr, state.ErrStateNotFound):
 		log.Ctx(ctx).Info("No state file — starting fresh")
@@ -97,6 +99,8 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 			return fmt.Errorf("state network mismatch: state=%q, configured=%q", loaded.Network, cfg.Network.Passphrase)
 		}
 		startLedger = loaded.LastLedgerSeq + 1
+		persistedEscrows = loaded.EscrowContracts
+		resumed = true
 		log.Ctx(ctx).Infof("Resuming from persisted cursor: next ledger %d", startLedger)
 	}
 
@@ -124,6 +128,23 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 	reg, err := registry.New(cfg.Escrow.ApprovedWasmHashes)
 	if err != nil {
 		return fmt.Errorf("building escrow registry: %w", err)
+	}
+
+	// Repopulate the registry: from persisted state on resume, otherwise
+	// from the optional seed file (escrows created before the indexed
+	// range). Discovery keeps adding new escrows from here on.
+	if resumed {
+		reg.Seed(persistedEscrows)
+		log.Ctx(ctx).Infof("Restored %d escrows from state", reg.Size())
+	} else {
+		seedIDs, serr := state.LoadSeed(cfg.Escrow.SeedPath)
+		if serr != nil {
+			return fmt.Errorf("loading escrow seed: %w", serr)
+		}
+		if len(seedIDs) > 0 {
+			reg.Seed(seedIDs)
+			log.Ctx(ctx).Infof("Seeded %d escrows from %s", reg.Size(), cfg.Escrow.SeedPath)
+		}
 	}
 
 	// Sink: where detected facts are delivered (noop or rabbitmq).
@@ -172,8 +193,9 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 		// published. On a crash between publish and save we reprocess the
 		// ledger and the consumer dedupes by message_id (at-least-once).
 		if err := store.Save(ctx, state.State{
-			Network:       cfg.Network.Passphrase,
-			LastLedgerSeq: currentLedger,
+			Network:         cfg.Network.Passphrase,
+			LastLedgerSeq:   currentLedger,
+			EscrowContracts: reg.Snapshot(),
 		}); err != nil {
 			return fmt.Errorf("saving state at ledger %d: %w", currentLedger, err)
 		}

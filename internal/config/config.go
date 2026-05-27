@@ -103,6 +103,12 @@ type EscrowConfig struct {
 	// (ESCROW_APPROVED_WASM_HASHES). May be empty in dev; the registry
 	// then recognises escrows only via seed.
 	ApprovedWasmHashes []string `env:"APPROVED_WASM_HASHES" envSeparator:","`
+
+	// SeedPath is an optional file of escrow contract IDs (one per line)
+	// loaded into the registry at first boot — bootstrap for escrows
+	// created before the indexed range. The API that deploys escrows can
+	// export it. Env: ESCROW_SEED_PATH.
+	SeedPath string `env:"SEED_PATH"`
 }
 
 // SinkConfig selects which transport receives envelopes. Concrete sink
