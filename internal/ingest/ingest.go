@@ -28,7 +28,6 @@ import (
 	"github.com/Trustless-Work/Indexer/internal/indexer/processors"
 	"github.com/Trustless-Work/Indexer/internal/indexer/registry"
 	"github.com/Trustless-Work/Indexer/internal/utils"
-	"github.com/alitto/pond/v2"
 	"github.com/stellar/go-stellar-sdk/clients/rpcclient"
 	sdkingest "github.com/stellar/go-stellar-sdk/ingest"
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
@@ -97,12 +96,7 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("building escrow registry: %w", err)
 	}
 
-	// Worker pool for parallel transaction processing within a ledger.
-	// Size 0 lets pond size itself from GOMAXPROCS.
-	pool := pond.NewPool(0)
-	defer pool.StopAndWait()
-
-	ledgerIndexer := indexer.NewIndexer(cfg.Network.Passphrase, reg, pool, false, false)
+	ledgerIndexer := indexer.NewIndexer(reg)
 
 	currentLedger := startLedger
 	log.Ctx(ctx).Infof("Starting ingestion loop from ledger %d (end=%d)", startLedger, endLedger)
@@ -119,19 +113,13 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 		}
 
 		started := time.Now()
-		buffer, events, err := processLedger(ctx, ledgerIndexer, cfg.Network.Passphrase, cfg.Indexer.GetLedgersLimit, meta)
+		events, err := processLedger(ctx, ledgerIndexer, cfg.Network.Passphrase, cfg.Indexer.GetLedgersLimit, meta)
 		if err != nil {
 			return fmt.Errorf("processing ledger %d: %w", currentLedger, err)
 		}
 
-		log.Ctx(ctx).Infof(
-			"Processed ledger %d in %v — txs=%d ops=%d state_changes=%d buf_escrows=%d trustline_changes=%d contract_changes=%d known_escrows=%d escrow_events=%d",
-			currentLedger, time.Since(started),
-			buffer.GetNumberOfTransactions(), buffer.GetNumberOfOperations(),
-			len(buffer.GetStateChanges()), len(buffer.GetEscrows()),
-			len(buffer.GetTrustlineChanges()), len(buffer.GetContractChanges()),
-			reg.Size(), len(events),
-		)
+		log.Ctx(ctx).Infof("Processed ledger %d in %v — known_escrows=%d escrow_events=%d",
+			currentLedger, time.Since(started), reg.Size(), len(events))
 
 		currentLedger++
 	}
@@ -140,26 +128,26 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 	return nil
 }
 
-// processLedger runs the per-ledger read -> process pipeline and returns
-// the populated buffer. Delivery is the caller's concern (none today).
+// processLedger reads a ledger's transactions and runs them through the
+// indexer, returning the detected escrow events. Delivery is the caller's
+// concern (none today).
 func processLedger(
 	ctx context.Context,
 	ledgerIndexer *indexer.Indexer,
 	networkPassphrase string,
 	limitHint int,
 	meta xdr.LedgerCloseMeta,
-) (*indexer.IndexerBuffer, []processors.EscrowEvent, error) {
+) ([]processors.EscrowEvent, error) {
 	transactions, err := readLedgerTransactions(ctx, networkPassphrase, limitHint, meta)
 	if err != nil {
-		return nil, nil, fmt.Errorf("reading transactions: %w", err)
+		return nil, fmt.Errorf("reading transactions: %w", err)
 	}
 
-	buffer := indexer.NewIndexerBuffer()
-	events, _, err := ledgerIndexer.ProcessLedgerTransactions(ctx, transactions, buffer)
+	events, err := ledgerIndexer.ProcessLedger(ctx, transactions)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return buffer, events, nil
+	return events, nil
 }
 
 // readLedgerTransactions slurps a ledger's transactions into memory using

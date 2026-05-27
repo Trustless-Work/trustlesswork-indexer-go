@@ -1,353 +1,73 @@
+// Package indexer is the core of the Indexer: it turns a ledger's
+// transactions into the escrow facts the pipeline forwards.
+//
+// Two sequential passes per ledger:
+//
+//   - Pass 1 (discovery): scan ledger-entry changes for contract
+//     instances whose WASM hash is approved and register them, so the
+//     detector knows which contracts are ours. Must run first — a factory
+//     deploy and the first event/deposit to that escrow can share a
+//     ledger.
+//   - Pass 2 (detection): walk contract events and emit the subset
+//     concerning known escrows (events + deposits), filtered by the
+//     registry.
+//
+// The indexer does not decode contract-specific data; it identifies facts
+// and forwards raw XDR. See docs/event-schema.md for the output contract.
 package indexer
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"sort"
-	"sync"
 
-	"github.com/Trustless-Work/Indexer/internal/entities"
 	"github.com/Trustless-Work/Indexer/internal/indexer/processors"
 	"github.com/Trustless-Work/Indexer/internal/indexer/registry"
-	"github.com/Trustless-Work/Indexer/internal/indexer/types"
-	"github.com/alitto/pond/v2"
-	"github.com/stellar/go-stellar-sdk/support/log"
-
-	set "github.com/deckarep/golang-set/v2"
 	"github.com/stellar/go-stellar-sdk/ingest"
-
-	contract_processors "github.com/Trustless-Work/Indexer/internal/indexer/processors/contracts"
 )
 
-// isContractAddress determines if the given address is a contract address (C...) or account address (G...)
-func isContractAddress(address string) bool {
-	// Contract addresses start with 'C' and account addresses start with 'G'
-	return len(address) > 0 && address[0] == 'C'
-}
-
-type IndexerBufferInterface interface {
-	PushTransaction(participant string, transaction types.Transaction)
-	PushOperation(participant string, operation types.Operation, transaction types.Transaction)
-	PushStateChange(transaction types.Transaction, operation types.Operation, stateChange types.StateChange)
-	GetTransactionsParticipants() map[string]set.Set[string]
-	GetOperationsParticipants() map[int64]set.Set[string]
-	GetAllParticipants() []string
-	GetNumberOfTransactions() int
-	GetNumberOfOperations() int
-	GetTransactions() []types.Transaction
-	GetOperations() []types.Operation
-	GetStateChanges() []types.StateChange
-	GetTrustlineChanges() []types.TrustlineChange
-	GetContractChanges() []types.ContractChange
-	PushContractChange(contractChange types.ContractChange)
-	PushTrustlineChange(trustlineChange types.TrustlineChange)
-	PushEscrow(escrow entities.Escrow)
-	GetEscrows() []entities.Escrow
-	MergeBuffer(other IndexerBufferInterface)
-}
-
-type TokenTransferProcessorInterface interface {
-	ProcessTransaction(ctx context.Context, tx ingest.LedgerTransaction) ([]types.StateChange, error)
-}
-
-type ParticipantsProcessorInterface interface {
-	GetTransactionParticipants(transaction ingest.LedgerTransaction) (set.Set[string], error)
-	GetOperationsParticipants(transaction ingest.LedgerTransaction) (map[int64]processors.OperationParticipants, error)
-}
-
-type EscrowProcessorInterface interface {
-	ProcessTransaction(ctx context.Context, opWrapper *processors.TransactionOperationWrapper) ([]entities.Escrow, error)
-	Name() string
-}
-
-type OperationProcessorInterface interface {
-	ProcessOperation(ctx context.Context, opWrapper *processors.TransactionOperationWrapper) ([]types.StateChange, error)
-	Name() string
-}
-
+// Indexer detects escrow facts (events and deposits) in a ledger's
+// transactions, using the registry to decide which contracts are ours.
 type Indexer struct {
-	discovery              *processors.EscrowDiscovery
-	eventDetector          *processors.EscrowEventDetector
-	participantsProcessor  ParticipantsProcessorInterface
-	tokenTransferProcessor TokenTransferProcessorInterface
-	escrowProcessor        EscrowProcessorInterface
-	processors             []OperationProcessorInterface
-	pool                   pond.Pool
-	skipTxMeta             bool
-	skipTxEnvelope         bool
-	networkPassphrase      string
+	discovery     *processors.EscrowDiscovery
+	eventDetector *processors.EscrowEventDetector
 }
 
-func NewIndexer(networkPassphrase string, reg *registry.Registry, pool pond.Pool, skipTxMeta bool, skipTxEnvelope bool) *Indexer {
+// NewIndexer builds an Indexer over the given escrow registry.
+func NewIndexer(reg *registry.Registry) *Indexer {
 	return &Indexer{
-		discovery:              processors.NewEscrowDiscovery(reg),
-		eventDetector:          processors.NewEscrowEventDetector(reg),
-		participantsProcessor:  processors.NewParticipantsProcessor(networkPassphrase),
-		tokenTransferProcessor: processors.NewTokenTransferProcessor(networkPassphrase),
-		escrowProcessor:        contract_processors.NewEscrowProcessor(networkPassphrase),
-		processors: []OperationProcessorInterface{
-			processors.NewContractDeployProcessor(networkPassphrase),
-			contract_processors.NewSACEventsProcessor(networkPassphrase),
-		},
-		pool:              pool,
-		skipTxMeta:        skipTxMeta,
-		skipTxEnvelope:    skipTxEnvelope,
-		networkPassphrase: networkPassphrase,
+		discovery:     processors.NewEscrowDiscovery(reg),
+		eventDetector: processors.NewEscrowEventDetector(reg),
 	}
 }
 
-// ProcessLedgerTransactions processes all transactions in a ledger.
-//
-// Pass 1 (sequential): escrow discovery. Every transaction's ledger-entry
-// changes are scanned for contract instances with an approved WASM hash,
-// registering them before any consumption. This ordering matters: a
-// factory deploy and the first event/deposit to that new escrow can land
-// in the same ledger, and the consumers must already know the escrow.
-//
-// Pass 2 (parallel): the per-transaction processors collect participants,
-// operations and state changes into the buffer.
-//
-// Pass 3 (sequential): escrow event/deposit detection against the
-// now-populated registry; the detected facts are returned for publishing.
-//
-// Returns the detected escrow events and the total participant count.
-func (i *Indexer) ProcessLedgerTransactions(ctx context.Context, transactions []ingest.LedgerTransaction, ledgerBuffer IndexerBufferInterface) ([]processors.EscrowEvent, int, error) {
+// ProcessLedger runs discovery then detection over the ledger's
+// transactions and returns the detected escrow events/deposits in the
+// order encountered. Discovery (pass 1) completes for the whole ledger
+// before detection (pass 2), so escrows deployed in the same ledger they
+// first receive events are already known.
+func (i *Indexer) ProcessLedger(ctx context.Context, transactions []ingest.LedgerTransaction) ([]processors.EscrowEvent, error) {
 	// Pass 1: discovery (registers approved-hash escrows).
 	for _, tx := range transactions {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if _, err := i.discovery.DiscoverFromTransaction(tx); err != nil {
-			return nil, 0, fmt.Errorf("escrow discovery at ledger=%d tx=%d: %w", tx.Ledger.LedgerSequence(), tx.Index, err)
+			return nil, fmt.Errorf("escrow discovery at ledger=%d tx=%d: %w", tx.Ledger.LedgerSequence(), tx.Index, err)
 		}
 	}
 
-	// Pass 2: parallel per-transaction processing.
-	group := i.pool.NewGroupContext(ctx)
-
-	txnBuffers := make([]*IndexerBuffer, len(transactions))
-	participantCounts := make([]int, len(transactions))
-	var errs []error
-	errMu := sync.Mutex{}
-
-	for idx, tx := range transactions {
-		index := idx
-		tx := tx
-		group.Submit(func() {
-			buffer := NewIndexerBuffer()
-			count, err := i.processTransaction(ctx, tx, buffer)
-			if err != nil {
-				errMu.Lock()
-				errs = append(errs, fmt.Errorf("processing transaction at ledger=%d tx=%d: %w", tx.Ledger.LedgerSequence(), tx.Index, err))
-				errMu.Unlock()
-				return
-			}
-			txnBuffers[index] = buffer
-			participantCounts[index] = count
-		})
-	}
-
-	if err := group.Wait(); err != nil {
-		return nil, 0, fmt.Errorf("waiting for transaction processing: %w", err)
-	}
-	if len(errs) > 0 {
-		return nil, 0, fmt.Errorf("processing transactions: %w", errors.Join(errs...))
-	}
-
-	// Merge buffers and count participants
-	totalParticipants := 0
-	for idx, buffer := range txnBuffers {
-		ledgerBuffer.MergeBuffer(buffer)
-		totalParticipants += participantCounts[idx]
-	}
-
-	// Pass 3: detect escrow events/deposits. The registry was populated
-	// in pass 1, so IsEscrow lookups are complete. Sequential and
-	// read-only; cheap relative to the structural pass.
+	// Pass 2: detection (registry-filtered events/deposits).
 	var events []processors.EscrowEvent
 	for _, tx := range transactions {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		evs, err := i.eventDetector.DetectFromTransaction(tx)
 		if err != nil {
-			return nil, 0, fmt.Errorf("detecting escrow events at ledger=%d tx=%d: %w", tx.Ledger.LedgerSequence(), tx.Index, err)
+			return nil, fmt.Errorf("detecting escrow events at ledger=%d tx=%d: %w", tx.Ledger.LedgerSequence(), tx.Index, err)
 		}
 		events = append(events, evs...)
 	}
 
-	return events, totalParticipants, nil
-}
-
-func (i *Indexer) processTransaction(ctx context.Context, tx ingest.LedgerTransaction, buffer *IndexerBuffer) (int, error) {
-
-	// Get transaction participants
-	txParticipants, err := i.participantsProcessor.GetTransactionParticipants(tx)
-	if err != nil {
-		return 0, fmt.Errorf("getting transaction participants: %w", err)
-	}
-
-	// Get operations participants
-	opsParticipants, err := i.participantsProcessor.GetOperationsParticipants(tx)
-	if err != nil {
-		return 0, fmt.Errorf("getting operations participants: %w", err)
-	}
-
-	// Get state changes
-	stateChanges, err := i.getTransactionStateChanges(ctx, tx, opsParticipants)
-	if err != nil {
-		return 0, fmt.Errorf("getting transaction state changes: %w", err)
-	}
-
-	// Get escrows
-	escrows := []entities.Escrow{}
-	for _, opPartipants := range opsParticipants {
-		escrowProcessed, err := i.escrowProcessor.ProcessTransaction(ctx, opPartipants.OpWrapper)
-		if err != nil && !errors.Is(err, processors.ErrInvalidOpType) {
-			return 0, fmt.Errorf("processing escrow: %w", err)
-		}
-		escrows = append(escrows, escrowProcessed...)
-	}
-
-	// Insert escrows in buffer
-	for _, escrow := range escrows {
-		buffer.PushEscrow(escrow)
-	}
-
-	// Convert transaction data
-	dataTx, err := processors.ConvertTransaction(&tx, i.skipTxMeta, i.skipTxEnvelope, i.networkPassphrase)
-	if err != nil {
-		return 0, fmt.Errorf("creating data transaction: %w", err)
-	}
-
-	// Count all unique participants for metrics
-	allParticipants := set.NewSet[string]()
-	allParticipants = allParticipants.Union(txParticipants)
-	for _, opParticipants := range opsParticipants {
-		allParticipants = allParticipants.Union(opParticipants.Participants)
-	}
-	for _, stateChange := range stateChanges {
-		allParticipants.Add(stateChange.AccountID)
-	}
-
-	// Insert transaction participants
-	for participant := range txParticipants.Iter() {
-		buffer.PushTransaction(participant, *dataTx)
-	}
-
-	// Insert operations participants
-	operationsMap := make(map[int64]*types.Operation)
-	for opID, opParticipants := range opsParticipants {
-		dataOp, opErr := processors.ConvertOperation(&tx, &opParticipants.OpWrapper.Operation, opID)
-		if opErr != nil {
-			return 0, fmt.Errorf("creating data operation: %w", opErr)
-		}
-		operationsMap[opID] = dataOp
-		for participant := range opParticipants.Participants.Iter() {
-			buffer.PushOperation(participant, *dataOp, *dataTx)
-		}
-	}
-
-	// Process state changes to extract trustline and contract changes
-	for _, stateChange := range stateChanges {
-		//exhaustive:ignore
-		switch stateChange.StateChangeCategory {
-		case types.StateChangeCategoryTrustline:
-			trustlineChange := types.TrustlineChange{
-				AccountID:    stateChange.AccountID,
-				OperationID:  stateChange.OperationID,
-				Asset:        stateChange.TrustlineAsset,
-				LedgerNumber: tx.Ledger.LedgerSequence(),
-			}
-			//exhaustive:ignore
-			switch *stateChange.StateChangeReason {
-			case types.StateChangeReasonAdd:
-				trustlineChange.Operation = types.TrustlineOpAdd
-			case types.StateChangeReasonRemove:
-				trustlineChange.Operation = types.TrustlineOpRemove
-			case types.StateChangeReasonUpdate:
-				continue
-			}
-			buffer.PushTrustlineChange(trustlineChange)
-		case types.StateChangeCategoryBalance:
-			// Only store contract changes when:
-			// - Account is C-address, OR
-			// - Account is G-address AND contract is NOT SAC or NATIVE (custom/SEP41 tokens): SAC token balances for G-addresses are stored in trustlines
-			accountIsContract := isContractAddress(stateChange.AccountID)
-			tokenIsSACOrNative := stateChange.ContractType == types.ContractTypeSAC || stateChange.ContractType == types.ContractTypeNative
-
-			if accountIsContract || !tokenIsSACOrNative {
-				contractChange := types.ContractChange{
-					AccountID:    stateChange.AccountID,
-					OperationID:  stateChange.OperationID,
-					ContractID:   stateChange.TokenID.String,
-					LedgerNumber: tx.Ledger.LedgerSequence(),
-					ContractType: stateChange.ContractType,
-				}
-				buffer.PushContractChange(contractChange)
-			}
-		}
-	}
-
-	// Sort state changes and set order for this transaction
-	sort.Slice(stateChanges, func(i, j int) bool {
-		return stateChanges[i].SortKey < stateChanges[j].SortKey
-	})
-
-	perOpIdx := make(map[int64]int)
-	for idx := range stateChanges {
-		sc := &stateChanges[idx]
-
-		// State changes are 1-indexed within an operation/transaction.
-		if sc.OperationID != 0 {
-			perOpIdx[sc.OperationID]++
-			sc.StateChangeOrder = int64(perOpIdx[sc.OperationID])
-		} else {
-			sc.StateChangeOrder = 1
-		}
-	}
-
-	// Insert state changes
-	for _, stateChange := range stateChanges {
-		// Skip empty state changes (no account to associate with)
-		if stateChange.AccountID == "" {
-			continue
-		}
-
-		// Get the correct operation for this state change
-		var operation types.Operation
-		if stateChange.OperationID != 0 {
-			correctOp := operationsMap[stateChange.OperationID]
-			if correctOp == nil {
-				log.Ctx(ctx).Errorf("operation ID %d not found in operations map for state change %+v", stateChange.OperationID, fmt.Sprintf("%d-%d", stateChange.ToID, stateChange.StateChangeOrder))
-				continue
-			}
-			operation = *correctOp
-		}
-		// For fee state changes (OperationID == 0), operation remains zero value
-		buffer.PushStateChange(*dataTx, operation, stateChange)
-	}
-
-	return allParticipants.Cardinality(), nil
-}
-
-// getTransactionStateChanges processes operations of a transaction and calculates all state changes
-func (i *Indexer) getTransactionStateChanges(ctx context.Context, transaction ingest.LedgerTransaction, opsParticipants map[int64]processors.OperationParticipants) ([]types.StateChange, error) {
-	stateChanges := []types.StateChange{}
-
-	// Process operations sequentially since there are only 3 processors per operation
-	// Creating a worker pool here adds unnecessary overhead
-	for _, opParticipants := range opsParticipants {
-		for _, processor := range i.processors {
-			processorStateChanges, processorErr := processor.ProcessOperation(ctx, opParticipants.OpWrapper)
-			if processorErr != nil && !errors.Is(processorErr, processors.ErrInvalidOpType) {
-				return nil, fmt.Errorf("processing %s state changes: %w", processor.Name(), processorErr)
-			}
-			stateChanges = append(stateChanges, processorStateChanges...)
-		}
-	}
-
-	// Get token transfer state changes
-	tokenTransferStateChanges, err := i.tokenTransferProcessor.ProcessTransaction(ctx, transaction)
-	if err != nil {
-		return nil, fmt.Errorf("processing token transfer state changes: %w", err)
-	}
-	stateChanges = append(stateChanges, tokenTransferStateChanges...)
-
-	return stateChanges, nil
+	return events, nil
 }
