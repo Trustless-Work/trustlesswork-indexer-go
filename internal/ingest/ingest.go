@@ -29,6 +29,7 @@ import (
 	"github.com/Trustless-Work/Indexer/internal/indexer/processors"
 	"github.com/Trustless-Work/Indexer/internal/indexer/registry"
 	sinkfactory "github.com/Trustless-Work/Indexer/internal/sink/factory"
+	"github.com/Trustless-Work/Indexer/internal/state"
 	"github.com/Trustless-Work/Indexer/internal/utils"
 	"github.com/stellar/go-stellar-sdk/clients/rpcclient"
 	sdkingest "github.com/stellar/go-stellar-sdk/ingest"
@@ -59,6 +60,18 @@ const (
 func Ingest(ctx context.Context, cfg *config.Config) error {
 	log.Ctx(ctx).Info(cfg.String())
 
+	// State store: persists the cursor (and, later, the escrow set). The
+	// flock makes a second instance fail fast instead of double-publishing.
+	store, err := state.NewFileStore(cfg.State.Path)
+	if err != nil {
+		return fmt.Errorf("opening state store: %w", err)
+	}
+	defer func() {
+		if cerr := store.Close(); cerr != nil {
+			log.Ctx(ctx).Warnf("closing state store: %v", cerr)
+		}
+	}()
+
 	backend, err := NewLedgerBackend(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("creating ledger backend: %w", err)
@@ -71,6 +84,21 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 
 	startLedger := cfg.Indexer.StartLedger
 	endLedger := cfg.Indexer.EndLedger
+
+	// Resume from the persisted cursor if we have one. A network mismatch
+	// is fatal — the operator must point at the right state file.
+	switch loaded, lerr := store.Load(ctx); {
+	case errors.Is(lerr, state.ErrStateNotFound):
+		log.Ctx(ctx).Info("No state file — starting fresh")
+	case lerr != nil:
+		return fmt.Errorf("loading state: %w", lerr)
+	default:
+		if loaded.Network != "" && loaded.Network != cfg.Network.Passphrase {
+			return fmt.Errorf("state network mismatch: state=%q, configured=%q", loaded.Network, cfg.Network.Passphrase)
+		}
+		startLedger = loaded.LastLedgerSeq + 1
+		log.Ctx(ctx).Infof("Resuming from persisted cursor: next ledger %d", startLedger)
+	}
 
 	// START_LEDGER unset (0) means "start from the network tip". Resolve it
 	// via a direct RPC call: the RPC rejects a PrepareRange starting at 0,
@@ -138,6 +166,16 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 			if err := outSink.Publish(ctx, events.FromEscrowEvent(cfg.Network.Name, ev)); err != nil {
 				return fmt.Errorf("publishing %s:%d at ledger %d: %w", ev.TxHash, ev.EventIndex, currentLedger, err)
 			}
+		}
+
+		// Persist the cursor only after every fact in this ledger was
+		// published. On a crash between publish and save we reprocess the
+		// ledger and the consumer dedupes by message_id (at-least-once).
+		if err := store.Save(ctx, state.State{
+			Network:       cfg.Network.Passphrase,
+			LastLedgerSeq: currentLedger,
+		}); err != nil {
+			return fmt.Errorf("saving state at ledger %d: %w", currentLedger, err)
 		}
 
 		log.Ctx(ctx).Infof("Processed ledger %d in %v — known_escrows=%d escrow_events=%d",
