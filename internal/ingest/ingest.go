@@ -24,9 +24,11 @@ import (
 	"time"
 
 	"github.com/Trustless-Work/Indexer/internal/config"
+	"github.com/Trustless-Work/Indexer/internal/events"
 	"github.com/Trustless-Work/Indexer/internal/indexer"
 	"github.com/Trustless-Work/Indexer/internal/indexer/processors"
 	"github.com/Trustless-Work/Indexer/internal/indexer/registry"
+	sinkfactory "github.com/Trustless-Work/Indexer/internal/sink/factory"
 	"github.com/Trustless-Work/Indexer/internal/utils"
 	"github.com/stellar/go-stellar-sdk/clients/rpcclient"
 	sdkingest "github.com/stellar/go-stellar-sdk/ingest"
@@ -96,6 +98,17 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("building escrow registry: %w", err)
 	}
 
+	// Sink: where detected facts are delivered (noop or rabbitmq).
+	outSink, err := sinkfactory.New(cfg)
+	if err != nil {
+		return fmt.Errorf("building sink: %w", err)
+	}
+	defer func() {
+		if cerr := outSink.Close(); cerr != nil {
+			log.Ctx(ctx).Warnf("closing sink: %v", cerr)
+		}
+	}()
+
 	ledgerIndexer := indexer.NewIndexer(reg)
 
 	currentLedger := startLedger
@@ -113,13 +126,22 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 		}
 
 		started := time.Now()
-		events, err := processLedger(ctx, ledgerIndexer, cfg.Network.Passphrase, cfg.Indexer.GetLedgersLimit, meta)
+		facts, err := processLedger(ctx, ledgerIndexer, cfg.Network.Passphrase, cfg.Indexer.GetLedgersLimit, meta)
 		if err != nil {
 			return fmt.Errorf("processing ledger %d: %w", currentLedger, err)
 		}
 
+		// Publish each detected fact. On failure we return (strict): a
+		// dropped publish would be silent data loss. Cursor persistence
+		// (resume without gaps) is a later step.
+		for _, ev := range facts {
+			if err := outSink.Publish(ctx, events.FromEscrowEvent(cfg.Network.Name, ev)); err != nil {
+				return fmt.Errorf("publishing %s:%d at ledger %d: %w", ev.TxHash, ev.EventIndex, currentLedger, err)
+			}
+		}
+
 		log.Ctx(ctx).Infof("Processed ledger %d in %v — known_escrows=%d escrow_events=%d",
-			currentLedger, time.Since(started), reg.Size(), len(events))
+			currentLedger, time.Since(started), reg.Size(), len(facts))
 
 		currentLedger++
 	}
@@ -143,11 +165,11 @@ func processLedger(
 		return nil, fmt.Errorf("reading transactions: %w", err)
 	}
 
-	events, err := ledgerIndexer.ProcessLedger(ctx, transactions)
+	facts, err := ledgerIndexer.ProcessLedger(ctx, transactions)
 	if err != nil {
 		return nil, err
 	}
-	return events, nil
+	return facts, nil
 }
 
 // readLedgerTransactions slurps a ledger's transactions into memory using

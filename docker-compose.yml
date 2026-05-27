@@ -103,6 +103,9 @@ services:
       NETWORK_NAME: ${NETWORK_NAME:-testnet}
       NETWORK_PASSPHRASE: ${NETWORK_PASSPHRASE:-Test SDF Network ; September 2015}
 
+      # --- Escrow identity: approved WASM hashes (single/multi release, v1+v2) ---
+      ESCROW_APPROVED_WASM_HASHES: ${ESCROW_APPROVED_WASM_HASHES:-38c42f5476192aabe5ae14aa773231a6e08c013ce4683aa387f2dc9e69376474,1bbce13523346de574214b8c6cc829a71a409d524e9a3435427da1c935885c04,0136f8fcc6e65dfe4aa3f8abe8dc386e5ec6ed503a123ee6275461ad2d9bd8df,3d9241655390f03c80536a2ef29dc350fb6c50f4d29dec380c366ab7ec24263c}
+
       # --- Sink: forced to rabbitmq when running under compose. ---
       SINK_TYPE: rabbitmq
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-admin}:${RABBITMQ_PASS:-admin}@rabbitmq:5672/
