@@ -86,8 +86,23 @@ known escrow. In both cases `contract_id` is normalised to the escrow.
 
 ### `type: "state"`
 
-`raw_xdr` is the `ContractData` `LedgerEntry` (the escrow's
-`DataKey::Escrow` value) as it stands after the change. Extra field:
+`raw_xdr` is the raw `ContractData` ledger entry data
+(`xdr.LedgerEntryData`) that carries the escrow's `DataKey::Escrow`
+state after the change. Two on-wire shapes exist depending on the
+contract version's storage model — the consumer dispatches on the
+entry's value type:
+
+- **`.persistent()` / `.temporary()` storage**: a dedicated entry keyed
+  by `Vec[Symbol("Escrow")]`; its value **is** the `Escrow` struct map.
+- **`.instance()` storage**: no dedicated entry exists. The entry is the
+  contract **instance**; `DataKey::Escrow` lives inside its
+  `ScContractInstance.storage` map under the `Vec[Symbol("Escrow")]`
+  key. The consumer reaches into `storage` to read the `Escrow` map.
+
+The Indexer stays agnostic and forwards whichever entry carries the
+state, preferring a dedicated data entry when both are present.
+
+Extra field:
 
 | Field | Type | Description |
 |---|---|---|

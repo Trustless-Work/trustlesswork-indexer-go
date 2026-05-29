@@ -45,29 +45,40 @@ func NewIndexer(reg *registry.Registry) *Indexer {
 // order encountered. Discovery (pass 1) completes for the whole ledger
 // before detection (pass 2), so escrows deployed in the same ledger they
 // first receive events are already known.
-func (i *Indexer) ProcessLedger(ctx context.Context, transactions []ingest.LedgerTransaction) ([]processors.EscrowEvent, error) {
+func (i *Indexer) ProcessLedger(ctx context.Context, transactions []ingest.LedgerTransaction) ([]processors.EscrowEvent, []string, error) {
 	// Pass 1: discovery (registers approved-hash escrows).
 	for _, tx := range transactions {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if _, err := i.discovery.DiscoverFromTransaction(tx); err != nil {
-			return nil, fmt.Errorf("escrow discovery at ledger=%d tx=%d: %w", tx.Ledger.LedgerSequence(), tx.Index, err)
+			return nil, nil, fmt.Errorf("escrow discovery at ledger=%d tx=%d: %w", tx.Ledger.LedgerSequence(), tx.Index, err)
 		}
 	}
 
-	// Pass 2: detection (registry-filtered events/deposits).
+	// Pass 2: detection (registry-filtered events/deposits). Also collect
+	// the unique set of escrow IDs that had activity in this ledger — the
+	// driver hands these to the state detector, which fetches their current
+	// DataKey::Escrow entry via RPC.
 	var events []processors.EscrowEvent
+	seen := map[string]struct{}{}
+	var activeEscrows []string
 	for _, tx := range transactions {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		evs, err := i.eventDetector.DetectFromTransaction(tx)
 		if err != nil {
-			return nil, fmt.Errorf("detecting escrow events at ledger=%d tx=%d: %w", tx.Ledger.LedgerSequence(), tx.Index, err)
+			return nil, nil, fmt.Errorf("detecting escrow events at ledger=%d tx=%d: %w", tx.Ledger.LedgerSequence(), tx.Index, err)
 		}
 		events = append(events, evs...)
+		for _, ev := range evs {
+			if _, ok := seen[ev.EscrowID]; !ok {
+				seen[ev.EscrowID] = struct{}{}
+				activeEscrows = append(activeEscrows, ev.EscrowID)
+			}
+		}
 	}
 
-	return events, nil
+	return events, activeEscrows, nil
 }

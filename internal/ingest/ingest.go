@@ -104,14 +104,18 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 		log.Ctx(ctx).Infof("Resuming from persisted cursor: next ledger %d", startLedger)
 	}
 
+	// Long-lived Soroban RPC client: used for tip resolution at boot and
+	// for state fetches in the loop (the canonical way to read contract
+	// state in Soroban).
+	rpc := rpcclient.NewClient(cfg.RPC.URL, &http.Client{Timeout: cfg.RPC.RequestTimeout})
+	defer func() { _ = rpc.Close() }()
+
 	// START_LEDGER unset (0) means "start from the network tip". Resolve it
 	// via a direct RPC call: the RPC rejects a PrepareRange starting at 0,
 	// and the backend's own GetLatestLedgerSequence requires PrepareRange
 	// first (chicken-and-egg), so we ask the RPC straight up.
 	if startLedger == 0 {
-		rpc := rpcclient.NewClient(cfg.RPC.URL, &http.Client{Timeout: cfg.RPC.RequestTimeout})
 		latest, err := rpc.GetLatestLedger(ctx)
-		_ = rpc.Close()
 		if err != nil {
 			return fmt.Errorf("resolving latest ledger from RPC: %w", err)
 		}
@@ -147,6 +151,11 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 		}
 	}
 
+	// State detector: fetches the current DataKey::Escrow entry of each
+	// escrow that had activity in a ledger via getLedgerEntries — the
+	// canonical Soroban way to read contract state.
+	stateDetector := processors.NewEscrowStateDetector(rpc, reg)
+
 	// Sink: where detected facts are delivered (noop or rabbitmq).
 	outSink, err := sinkfactory.New(cfg)
 	if err != nil {
@@ -175,17 +184,28 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 		}
 
 		started := time.Now()
-		facts, err := processLedger(ctx, ledgerIndexer, cfg.Network.Passphrase, cfg.Indexer.GetLedgersLimit, meta)
+		facts, activeEscrows, err := processLedger(ctx, ledgerIndexer, cfg.Network.Passphrase, cfg.Indexer.GetLedgersLimit, meta)
 		if err != nil {
 			return fmt.Errorf("processing ledger %d: %w", currentLedger, err)
 		}
 
-		// Publish each detected fact. On failure we return (strict): a
-		// dropped publish would be silent data loss. Cursor persistence
-		// (resume without gaps) is a later step.
+		// Publish each detected event/deposit. On failure we return
+		// (strict): a dropped publish would be silent data loss.
 		for _, ev := range facts {
 			if err := outSink.Publish(ctx, events.FromEscrowEvent(cfg.Network.Name, ev)); err != nil {
-				return fmt.Errorf("publishing %s:%d at ledger %d: %w", ev.TxHash, ev.EventIndex, currentLedger, err)
+				return fmt.Errorf("publishing event %s:%d at ledger %d: %w", ev.TxHash, ev.EventIndex, currentLedger, err)
+			}
+		}
+
+		// Fetch current state for each escrow with activity, then publish.
+		ledgerClosedAt := time.Unix(meta.LedgerCloseTime(), 0).UTC()
+		states, err := stateDetector.FetchStates(ctx, activeEscrows, currentLedger, ledgerClosedAt)
+		if err != nil {
+			return fmt.Errorf("fetching state at ledger %d: %w", currentLedger, err)
+		}
+		for _, sc := range states {
+			if err := outSink.Publish(ctx, events.FromStateChange(cfg.Network.Name, sc)); err != nil {
+				return fmt.Errorf("publishing state %s at ledger %d: %w", sc.EscrowID, currentLedger, err)
 			}
 		}
 
@@ -200,8 +220,8 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 			return fmt.Errorf("saving state at ledger %d: %w", currentLedger, err)
 		}
 
-		log.Ctx(ctx).Infof("Processed ledger %d in %v — known_escrows=%d escrow_events=%d",
-			currentLedger, time.Since(started), reg.Size(), len(facts))
+		log.Ctx(ctx).Infof("Processed ledger %d in %v — known_escrows=%d escrow_events=%d state_changes=%d",
+			currentLedger, time.Since(started), reg.Size(), len(facts), len(states))
 
 		currentLedger++
 	}
@@ -219,17 +239,17 @@ func processLedger(
 	networkPassphrase string,
 	limitHint int,
 	meta xdr.LedgerCloseMeta,
-) ([]processors.EscrowEvent, error) {
+) ([]processors.EscrowEvent, []string, error) {
 	transactions, err := readLedgerTransactions(ctx, networkPassphrase, limitHint, meta)
 	if err != nil {
-		return nil, fmt.Errorf("reading transactions: %w", err)
+		return nil, nil, fmt.Errorf("reading transactions: %w", err)
 	}
 
-	facts, err := ledgerIndexer.ProcessLedger(ctx, transactions)
+	facts, activeEscrows, err := ledgerIndexer.ProcessLedger(ctx, transactions)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return facts, nil
+	return facts, activeEscrows, nil
 }
 
 // readLedgerTransactions slurps a ledger's transactions into memory using
