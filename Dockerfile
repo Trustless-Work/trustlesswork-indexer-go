@@ -10,7 +10,7 @@ WORKDIR /src
 # Cache the module download separately from the source so editing code
 # doesn't bust the module layer.
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod \
+RUN --mount=type=cache,id=gomod,target=/go/pkg/mod \
     go mod download
 
 COPY . .
@@ -20,8 +20,8 @@ COPY . .
 # Unstamped builds report "dev" via /status.
 ARG VERSION=dev
 
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
+RUN --mount=type=cache,id=gomod,target=/go/pkg/mod \
+    --mount=type=cache,id=gobuild,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux \
     go build \
         -trimpath \
