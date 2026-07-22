@@ -17,6 +17,14 @@ import (
 // (DataKey::Escrow). Stable across all four contract versions.
 const escrowStateKey = "Escrow"
 
+// maxLedgerEntryKeysPerRequest bounds a single getLedgerEntries call. Soroban
+// RPC rejects requests over 200 keys, and we build up to 4 candidate keys per
+// escrow — so a ledger touching >50 escrows would otherwise produce an
+// over-limit request that fails DETERMINISTICALLY, and since a state-fetch
+// error halts the loop and the same ledger is reprocessed, it crash-loops
+// forever. Chunking keeps every request within the cap.
+const maxLedgerEntryKeysPerRequest = 200
+
 // EscrowStateChange is the current state of one known escrow's
 // DataKey::Escrow entry as fetched from the Soroban RPC right after a
 // ledger that had activity for that escrow. RawXDR is the ContractData
@@ -80,12 +88,32 @@ func (d *EscrowStateDetector) FetchStates(ctx context.Context, escrowIDs []strin
 		return nil, nil
 	}
 
-	resp, err := d.rpc.GetLedgerEntries(ctx, protocol.GetLedgerEntriesRequest{Keys: keys})
-	if err != nil {
-		return nil, fmt.Errorf("rpc getLedgerEntries: %w", err)
+	// Chunk into requests within the RPC key cap and merge the results.
+	// Splitting an escrow's candidate keys across chunks is harmless:
+	// buildStateChanges dedups per escrow over the full merged entry set.
+	entries := make([]protocol.LedgerEntryResult, 0, len(keys))
+	for _, chunk := range chunkStrings(keys, maxLedgerEntryKeysPerRequest) {
+		resp, err := d.rpc.GetLedgerEntries(ctx, protocol.GetLedgerEntriesRequest{Keys: chunk})
+		if err != nil {
+			return nil, fmt.Errorf("rpc getLedgerEntries (%d keys of %d): %w", len(chunk), len(keys), err)
+		}
+		entries = append(entries, resp.Entries...)
 	}
 
-	return d.buildStateChanges(resp.Entries, ledgerSeq, ledgerClosedAt), nil
+	return d.buildStateChanges(entries, ledgerSeq, ledgerClosedAt), nil
+}
+
+// chunkStrings splits s into consecutive slices of at most size elements.
+// size <= 0 yields a single chunk. The concatenation of the result equals s.
+func chunkStrings(s []string, size int) [][]string {
+	if size <= 0 || len(s) <= size {
+		return [][]string{s}
+	}
+	chunks := make([][]string, 0, (len(s)+size-1)/size)
+	for start := 0; start < len(s); start += size {
+		chunks = append(chunks, s[start:min(start+size, len(s))])
+	}
+	return chunks
 }
 
 // buildStateChanges turns a getLedgerEntries response into at most one
