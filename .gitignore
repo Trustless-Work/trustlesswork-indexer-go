@@ -14,9 +14,6 @@ indexer.watchlist.seed.json
 # Deployments
 
 
-# AI
-.claude/*
-
 # IDE's
 .vscode/*
 .idea
