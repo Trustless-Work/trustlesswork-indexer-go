@@ -89,6 +89,13 @@ type IndexerConfig struct {
 	// internal buffer size; 100 has worked well empirically.
 	GetLedgersLimit int `env:"GET_LEDGERS_LIMIT" envDefault:"100"`
 
+	// SweepEnabled toggles the reconciliation sweep (one budgeted
+	// getLedgerEntries batch per ledger at the tip, rotating over the
+	// whole watchlist). On by default; the kill switch exists for
+	// operational emergencies (e.g. an RPC provider rate-limiting the
+	// extra request) without needing a build.
+	SweepEnabled bool `env:"SWEEP_ENABLED" envDefault:"true"`
+
 	// Workers caps the per-ledger parallel-tx worker pool. Zero means
 	// "auto" (runtime.NumCPU * 2 at construction time). Setting an
 	// explicit value is useful for resource-constrained environments.

@@ -42,6 +42,11 @@ import (
 )
 
 const (
+	// sweepMaxLedgerAge gates the reconciliation sweep to the tip: a
+	// ledger older than this means we are catching up, and every key of
+	// RPC budget belongs to closing the lag, not to reconciling state
+	// that the catch-up itself will refresh.
+	sweepMaxLedgerAge = 30 * time.Second
 	// maxLedgerFetchRetries caps how many transient failures we accept
 	// when fetching a single ledger before giving up.
 	maxLedgerFetchRetries = 10
@@ -245,6 +250,10 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 	// canonical Soroban way to read contract state.
 	stateDetector := processors.NewEscrowStateDetector(rpc, reg)
 
+	// Reconciliation sweep: rotates over the whole watchlist so removals
+	// and post-gap drift are noticed without waiting for activity.
+	sweeper := processors.NewSweeper(reg)
+
 	ledgerIndexer := indexer.NewIndexer(reg)
 
 	// Progress tracker + health server. The tracker always exists (the
@@ -293,6 +302,31 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 		for _, sc := range states {
 			if err := outSink.Publish(ctx, events.FromStateChange(cfg.Network.Name, sc)); err != nil {
 				return fmt.Errorf("publishing state %s at ledger %d: %w", sc.EscrowID, currentLedger, err)
+			}
+		}
+
+		// Reconciliation sweep: one budgeted batch per ledger, only at the
+		// tip. A fetch failure here is SKIP, never fatal — reconciliation
+		// is best-effort by design and the rotation covers the same ids
+		// again next pass; turning a sweep 429 into a crash-loop would be
+		// worse than not sweeping at all. Publish failures stay fatal:
+		// sink loss is a different failure class than a flaky RPC read.
+		if cfg.Indexer.SweepEnabled && time.Since(ledgerClosedAt) <= sweepMaxLedgerAge {
+			batch, passDone := sweeper.NextBatch(currentLedger, stateDetector.KeyCost, processors.MaxLedgerEntryKeys)
+			if len(batch) > 0 {
+				sweepStates, serr := stateDetector.FetchStatesSince(ctx, batch, currentLedger, ledgerClosedAt, sweeper.ModifiedSince())
+				if serr != nil {
+					log.Ctx(ctx).Warnf("Reconciliation sweep skipped a batch of %d escrows: %v", len(batch), serr)
+				} else {
+					for _, sc := range sweepStates {
+						if err := outSink.Publish(ctx, events.FromStateChange(cfg.Network.Name, sc)); err != nil {
+							return fmt.Errorf("publishing sweep state %s at ledger %d: %w", sc.EscrowID, currentLedger, err)
+						}
+					}
+					if passDone {
+						log.Ctx(ctx).Infof("Reconciliation sweep pass complete at ledger %d — watchlist=%d", currentLedger, reg.Size())
+					}
+				}
 			}
 		}
 
