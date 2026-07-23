@@ -20,6 +20,7 @@ import (
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/stellar/go-stellar-sdk/support/log"
 
 	"github.com/Trustless-Work/Indexer/internal/events"
 	"github.com/Trustless-Work/Indexer/internal/sink"
@@ -33,6 +34,13 @@ type Sink struct {
 	conn     *amqp.Connection
 	channel  *amqp.Channel
 	confirms chan amqp.Confirmation // nil when PublisherConfirms is false
+	// returns receives basic.return frames for unroutable mandatory
+	// publishes. CRITICAL subtlety: the broker CONFIRMS a returned message
+	// (it was received, just not routed), so the confirm alone would let
+	// the cursor advance over silently-dropped data — exactly the loss
+	// mandatory publishing exists to prevent. Publish checks this channel
+	// after every confirm.
+	returns chan amqp.Return
 }
 
 var _ sink.Sink = (*Sink)(nil)
@@ -85,9 +93,31 @@ func (s *Sink) connect() error {
 		confirms = ch.NotifyPublish(make(chan amqp.Confirmation, 1))
 	}
 
+	// Buffer of 1 for the same serialization reason. The library delivers
+	// the basic.return BEFORE the confirm of the same publish (frames are
+	// dispatched in wire order), so by the time Publish sees the confirm,
+	// any return for that message is already buffered here.
+	returns := ch.NotifyReturn(make(chan amqp.Return, 1))
+
+	// Surface broker-wide flow control (memory/disk alarm) in the logs the
+	// moment it happens: without this, a blocked broker looks like a bare
+	// confirm timeout and the real cause is invisible. The goroutine ends
+	// when the connection closes (the library closes the channel).
+	blocked := conn.NotifyBlocked(make(chan amqp.Blocking, 1))
+	go func() {
+		for b := range blocked {
+			if b.Active {
+				log.Warnf("RabbitMQ blocked publishing: %s (broker alarm — publishes will stall)", b.Reason)
+			} else {
+				log.Info("RabbitMQ unblocked publishing")
+			}
+		}
+	}()
+
 	s.conn = conn
 	s.channel = ch
 	s.confirms = confirms
+	s.returns = returns
 	return nil
 }
 
@@ -114,7 +144,11 @@ func (s *Sink) Publish(ctx context.Context, env events.Envelope) error {
 		Timestamp:    env.PublishedAt,
 		Body:         body,
 	}
-	if err := s.channel.PublishWithContext(ctx, s.cfg.Exchange, env.RoutingKey(), false, false, pub); err != nil {
+	// mandatory=true: an envelope that matches NO queue binding comes back
+	// as a basic.return instead of being dropped silently. Before this,
+	// publishing with the consumer's queue missing confirmed fine and the
+	// cursor advanced over lost data (audit Sprint 5).
+	if err := s.channel.PublishWithContext(ctx, s.cfg.Exchange, env.RoutingKey(), true, false, pub); err != nil {
 		return fmt.Errorf("%w: publishing %s: %v", sink.ErrSinkUnavailable, env.MessageID, err)
 	}
 
@@ -126,6 +160,15 @@ func (s *Sink) Publish(ctx context.Context, env events.Envelope) error {
 	case confirm := <-s.confirms:
 		if !confirm.Ack {
 			return fmt.Errorf("%w: broker nacked %s", sink.ErrSinkPublishRejected, env.MessageID)
+		}
+		// A returned message is CONFIRMED (received but unroutable), so
+		// the ack alone is not success. Publish is serialized, so any
+		// buffered return belongs to this publish.
+		select {
+		case ret := <-s.returns:
+			return fmt.Errorf("%w: broker returned %s unroutable (reply %d: %s) — is the consumer's queue bound?",
+				sink.ErrSinkPublishRejected, env.MessageID, ret.ReplyCode, ret.ReplyText)
+		default:
 		}
 		return nil
 	case <-time.After(s.cfg.PublishConfirmTimeout):

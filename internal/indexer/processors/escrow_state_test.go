@@ -228,3 +228,40 @@ func dedicatedEntryB64(t *testing.T, contract xdr.ScAddress) string {
 	}
 	return b64
 }
+
+func TestAppendRemoved_MissingEscrowBecomesRemoved(t *testing.T) {
+	closedAt := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	present := []EscrowStateChange{
+		{EscrowID: "CAAA", StateChangeType: "updated", LedgerSeq: 7, RawXDR: "AAAA"},
+	}
+
+	out := appendRemoved([]string{"CAAA", "CBBB"}, present, 7, closedAt)
+
+	if len(out) != 2 {
+		t.Fatalf("changes = %d, want 2 (one updated + one removed)", len(out))
+	}
+	// Stable by-EscrowID order: CAAA first.
+	if out[0].EscrowID != "CAAA" || out[0].StateChangeType != "updated" {
+		t.Fatalf("first change = %+v, want CAAA updated", out[0])
+	}
+	removed := out[1]
+	if removed.EscrowID != "CBBB" || removed.StateChangeType != "removed" {
+		t.Fatalf("second change = %+v, want CBBB removed", removed)
+	}
+	if removed.RawXDR != "" {
+		t.Errorf("removed change must carry no XDR; got %q", removed.RawXDR)
+	}
+	if removed.LedgerSeq != 7 || !removed.LedgerClosedAt.Equal(closedAt) {
+		t.Errorf("removed change anchors = %+v, want ledger 7 at %v", removed, closedAt)
+	}
+}
+
+func TestAppendRemoved_AllPresentIsUntouched(t *testing.T) {
+	present := []EscrowStateChange{
+		{EscrowID: "CAAA", StateChangeType: "updated", LedgerSeq: 7},
+	}
+	out := appendRemoved([]string{"CAAA"}, present, 7, time.Now())
+	if len(out) != 1 || out[0].StateChangeType != "updated" {
+		t.Fatalf("unexpected changes: %+v", out)
+	}
+}

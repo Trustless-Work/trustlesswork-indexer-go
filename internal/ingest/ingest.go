@@ -177,6 +177,19 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 		}
 	}
 
+	// Sink: where detected facts are delivered (noop or rabbitmq). Built
+	// before the start-ledger clamp because a clamp publishes its gap
+	// evidence through it.
+	outSink, err := sinkfactory.New(cfg)
+	if err != nil {
+		return fmt.Errorf("building sink: %w", err)
+	}
+	defer func() {
+		if cerr := outSink.Close(); cerr != nil {
+			log.Ctx(ctx).Warnf("closing sink: %v", cerr)
+		}
+	}()
+
 	// Clamp the start ledger against the window this RPC actually serves.
 	// Without this, a cursor that fell out of retention makes PrepareRange
 	// fail deterministically and the process crash-loops until a human
@@ -212,6 +225,17 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("backfill range is unservable: clamped start %d exceeds INDEXER_END_LEDGER %d (range fell out of RPC retention) — use an archive RPC for this range", startLedger, endLedger)
 	}
 
+	// Republish every recorded gap on every boot (at-least-once): a crash
+	// between recording a gap and publishing it must not lose the signal.
+	// The message id is deterministic ("gap:{net}:{from}:{to}"), so the
+	// consumer treats repeats as no-ops; the list shrinks only when an
+	// operator deletes a replayed gap from the state file.
+	for _, g := range gaps {
+		if err := outSink.Publish(ctx, events.FromGap(cfg.Network.Name, g.FromLedger, g.ToLedger, g.Reason, g.DetectedAt)); err != nil {
+			return fmt.Errorf("publishing gap evidence [%d, %d]: %w", g.FromLedger, g.ToLedger, err)
+		}
+	}
+
 	if err := prepareBackendRange(ctx, backend, startLedger, endLedger); err != nil {
 		return fmt.Errorf("preparing backend range: %w", err)
 	}
@@ -220,17 +244,6 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 	// escrow that had activity in a ledger via getLedgerEntries — the
 	// canonical Soroban way to read contract state.
 	stateDetector := processors.NewEscrowStateDetector(rpc, reg)
-
-	// Sink: where detected facts are delivered (noop or rabbitmq).
-	outSink, err := sinkfactory.New(cfg)
-	if err != nil {
-		return fmt.Errorf("building sink: %w", err)
-	}
-	defer func() {
-		if cerr := outSink.Close(); cerr != nil {
-			log.Ctx(ctx).Warnf("closing sink: %v", cerr)
-		}
-	}()
 
 	ledgerIndexer := indexer.NewIndexer(reg)
 

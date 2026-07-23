@@ -70,12 +70,17 @@ func (d *EscrowStateDetector) FetchStates(ctx context.Context, escrowIDs []strin
 	// Persistent (canonical), bare Symbol Persistent (some sdk
 	// serializations), Vec[Symbol] Temporary, and the instance entry
 	// itself (always exists — useful as a sentinel for matching responses).
+	// requested tracks the escrows whose keys actually went on the wire:
+	// only those can be judged "removed" when the response has no entry
+	// for them (an id that failed key-building was never asked about).
 	keys := make([]string, 0, len(escrowIDs)*4)
+	requested := make([]string, 0, len(escrowIDs))
 	for _, id := range escrowIDs {
 		candidates, err := escrowStateLedgerKeys(id)
 		if err != nil {
 			continue
 		}
+		requested = append(requested, id)
 		for _, key := range candidates {
 			b64, err := xdr.MarshalBase64(key)
 			if err != nil {
@@ -100,7 +105,36 @@ func (d *EscrowStateDetector) FetchStates(ctx context.Context, escrowIDs []strin
 		entries = append(entries, resp.Entries...)
 	}
 
-	return d.buildStateChanges(entries, ledgerSeq, ledgerClosedAt), nil
+	changes := d.buildStateChanges(entries, ledgerSeq, ledgerClosedAt)
+	return appendRemoved(requested, changes, ledgerSeq, ledgerClosedAt), nil
+}
+
+// appendRemoved adds a "removed" state change for every requested escrow
+// that produced NO entry at all in the RPC response — not even its
+// instance sentinel — meaning the contract's data is gone from the ledger
+// (TTL expiry, or withdraw_remaining_funds which emits no Soroban event).
+// Schema 1.1: a removed change carries an empty RawXDR; the signal IS the
+// payload. Pure so it can be unit-tested without a live RPC.
+func appendRemoved(requested []string, present []EscrowStateChange, ledgerSeq uint32, ledgerClosedAt time.Time) []EscrowStateChange {
+	seen := make(map[string]struct{}, len(present))
+	for _, sc := range present {
+		seen[sc.EscrowID] = struct{}{}
+	}
+	out := present
+	for _, id := range requested {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		out = append(out, EscrowStateChange{
+			EscrowID:        id,
+			StateChangeType: "removed",
+			LedgerSeq:       ledgerSeq,
+			LedgerClosedAt:  ledgerClosedAt,
+		})
+	}
+	// Keep the stable by-EscrowID order buildStateChanges promises.
+	sort.Slice(out, func(i, j int) bool { return out[i].EscrowID < out[j].EscrowID })
+	return out
 }
 
 // chunkStrings splits s into consecutive slices of at most size elements.

@@ -56,8 +56,8 @@ Every message, regardless of `type`, carries these fields (snake_case):
 
 | Field | Type | Description |
 |---|---|---|
-| `schema_version` | string | Wire-contract version (today `"1.0"`). Consumers dispatch to version-specific handlers and MUST ignore unknown fields. |
-| `type` | string | Discriminator: `event`, `deposit`, or `state`. |
+| `schema_version` | string | Wire-contract version (today `"1.1"`). Consumers dispatch to version-specific handlers and MUST ignore unknown fields. |
+| `type` | string | Discriminator: `event`, `deposit`, `state`, or `control` (1.1). |
 | `network` | string | `testnet` or `mainnet`. |
 | `contract_id` | string | **The TW escrow** this message concerns (`C…` strkey). The uniform key to group "everything for escrow X". For `event` it is the emitter; for `deposit` it is the recipient (`to`); for `state` it is the owner of the `ContractData`. |
 | `ledger_seq` | uint32 | Ledger sequence the fact occurred in. |
@@ -111,6 +111,34 @@ Extra field:
 `state` messages carry no `event_index` (a state change is not an
 event); use `0` for the order key's third component.
 
+**`removed` (1.1):** when the entry no longer exists on-chain (TTL
+expiry, or `withdraw_remaining_funds`, which emits no Soroban event),
+the Indexer publishes `state_change_type: "removed"` with an **empty**
+`raw_xdr` — there is no entry left to carry; the signal is the payload.
+Consumers MUST branch on `state_change_type` before decoding.
+
+### `type: "control"` (1.1)
+
+An out-of-band fact about the PIPELINE itself, not about one escrow:
+`contract_id` and `raw_xdr` are empty. Today the only kind is
+`gap_detected`: the Indexer clamped its cursor past a ledger range it
+could not serve (RPC retention) and that range's history is missing
+until an operator replays it.
+
+| Field | Type | Description |
+|---|---|---|
+| `control_kind` | string | `gap_detected` (unknown kinds should be dead-lettered for post-upgrade replay). |
+| `gap_from_ledger` | number | First skipped ledger (inclusive). |
+| `gap_to_ledger` | number | Last skipped ledger (inclusive). |
+| `reason` | string | Machine-readable cause, e.g. `rpc_retention`. |
+| `detected_at` | string | RFC 3339 detection time (observability anchor). |
+
+`ledger_seq` is stamped with `gap_to_ledger + 1` (where processing
+resumed). `message_id` is deterministic — `gap:{network}:{from}:{to}` —
+because the Indexer republishes recorded gaps on EVERY boot
+(at-least-once); consumers dedupe on it and only the first arrival
+should alert.
+
 ## `message_id` construction
 
 | type | `message_id` | Consumer semantics |
@@ -140,6 +168,7 @@ stellar.mainnet.escrow.event.tw_release
 stellar.mainnet.escrow.deposit.token_transfer
 stellar.mainnet.escrow.state.updated
 stellar.mainnet.escrow.state.removed
+stellar.mainnet.escrow.control.gap_detected
 ```
 
 Binding examples:
@@ -164,7 +193,7 @@ receive it with no Indexer change. New event kinds are therefore an
 ```jsonc
 // 1) Lifecycle event (history)
 {
-  "schema_version": "1.0", "type": "event", "network": "testnet",
+  "schema_version": "1.1", "type": "event", "network": "testnet",
   "contract_id": "CESCROW...", "ledger_seq": 58762521,
   "ledger_closed_at": "2026-05-21T18:04:11Z",
   "tx_hash": "a1b2", "tx_index": 7,
@@ -175,7 +204,7 @@ receive it with no Indexer change. New event kinds are therefore an
 
 // 2) External deposit (SAC transfer to the escrow)
 {
-  "schema_version": "1.0", "type": "deposit", "network": "testnet",
+  "schema_version": "1.1", "type": "deposit", "network": "testnet",
   "contract_id": "CESCROW...", "ledger_seq": 58762530,
   "ledger_closed_at": "2026-05-21T18:05:01Z",
   "tx_hash": "c3d4", "tx_index": 2,
@@ -186,7 +215,7 @@ receive it with no Indexer change. New event kinds are therefore an
 
 // 3) State snapshot (ContractData changed)
 {
-  "schema_version": "1.0", "type": "state", "network": "testnet",
+  "schema_version": "1.1", "type": "state", "network": "testnet",
   "contract_id": "CESCROW...", "ledger_seq": 58762530,
   "ledger_closed_at": "2026-05-21T18:05:01Z",
   "tx_hash": "c3d4", "tx_index": 2,
