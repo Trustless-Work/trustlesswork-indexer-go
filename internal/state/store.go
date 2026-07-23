@@ -11,10 +11,12 @@ package state
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 // CurrentVersion is the schema version of the on-disk State. Bump on a
-// backwards-incompatible change.
+// backwards-incompatible change. Additive fields (like Gaps) do NOT bump
+// it: older files simply load with the zero value.
 const CurrentVersion = 1
 
 // State is the persisted runtime state.
@@ -30,6 +32,23 @@ type State struct {
 	// EscrowContracts is the persisted escrow set (the registry snapshot).
 	// Populated and consumed once registry persistence is wired.
 	EscrowContracts []string `json:"escrow_contracts"`
+	// Gaps records every ledger range this instance knowingly skipped
+	// (e.g. the cursor fell below the RPC retention window and was
+	// clamped forward). It is the durable evidence a later backfill needs
+	// to know WHAT to replay — without it, a clamp silently rewrites
+	// history as "nothing happened here". Append-only; entries are
+	// removed only by an operator after the range has been replayed.
+	Gaps []Gap `json:"gaps,omitempty"`
+}
+
+// Gap is one contiguous ledger range that was skipped instead of
+// processed. FromLedger/ToLedger are inclusive bounds.
+type Gap struct {
+	FromLedger uint32 `json:"from_ledger"`
+	ToLedger   uint32 `json:"to_ledger"`
+	// Reason is a short machine-readable cause, e.g. "rpc_retention".
+	Reason     string    `json:"reason"`
+	DetectedAt time.Time `json:"detected_at"`
 }
 
 // Store persists and restores State.

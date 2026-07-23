@@ -27,6 +27,7 @@ import (
 
 	"github.com/Trustless-Work/Indexer/internal/config"
 	"github.com/Trustless-Work/Indexer/internal/events"
+	"github.com/Trustless-Work/Indexer/internal/health"
 	"github.com/Trustless-Work/Indexer/internal/indexer"
 	"github.com/Trustless-Work/Indexer/internal/indexer/processors"
 	"github.com/Trustless-Work/Indexer/internal/indexer/registry"
@@ -97,7 +98,10 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 
 	// Resume from the persisted cursor + escrow set if we have one. A
 	// network mismatch is fatal — point at the right state file.
+	// Gaps ride along unchanged: they are append-only evidence and every
+	// Save below must carry them forward or the record is lost.
 	var persistedEscrows []string
+	var gaps []state.Gap
 	resumed := false
 	switch loaded, lerr := store.Load(ctx); {
 	case errors.Is(lerr, state.ErrStateNotFound):
@@ -110,6 +114,7 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 		}
 		startLedger = loaded.LastLedgerSeq + 1
 		persistedEscrows = loaded.EscrowContracts
+		gaps = loaded.Gaps
 		resumed = true
 		log.Ctx(ctx).Infof("Resuming from persisted cursor: next ledger %d", startLedger)
 	}
@@ -146,12 +151,10 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 		startLedger = latest.Sequence
 	}
 
-	if err := prepareBackendRange(ctx, backend, startLedger, endLedger); err != nil {
-		return fmt.Errorf("preparing backend range: %w", err)
-	}
-
 	// Escrow registry: identifies "our" contracts by approved WASM hash.
-	// Populated by the discovery pass (and, later, an API seed).
+	// Populated by the discovery pass (and, later, an API seed). Built
+	// before the start-ledger clamp so a clamp can persist the full
+	// state (cursor + escrows + gap) in one atomic write.
 	reg, err := registry.New(cfg.Escrow.ApprovedWasmHashes)
 	if err != nil {
 		return fmt.Errorf("building escrow registry: %w", err)
@@ -174,6 +177,45 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 		}
 	}
 
+	// Clamp the start ledger against the window this RPC actually serves.
+	// Without this, a cursor that fell out of retention makes PrepareRange
+	// fail deterministically and the process crash-loops until a human
+	// intervenes (the 2026-07-22 incident). Skipping forward loses data,
+	// so the skipped range is recorded as a Gap and persisted BEFORE any
+	// ledger is processed — evidence for a later backfill.
+	rpcWindow, err := rpc.GetHealth(ctx)
+	if err != nil {
+		return fmt.Errorf("fetching RPC health for start-ledger clamp: %w", err)
+	}
+	log.Ctx(ctx).Infof("RPC window: oldest=%d latest=%d retention=%d ledgers",
+		rpcWindow.OldestLedger, rpcWindow.LatestLedger, rpcWindow.LedgerRetentionWindow)
+	if clamped, gap, cerr := clampStartLedger(startLedger, rpcWindow.OldestLedger, rpcWindow.LatestLedger, time.Now()); cerr != nil {
+		return cerr
+	} else if gap != nil {
+		log.Ctx(ctx).Warnf("Start ledger %d is below RPC retention (oldest %d): clamping forward — ledgers [%d, %d] are SKIPPED and recorded as a gap for later backfill",
+			startLedger, rpcWindow.OldestLedger, gap.FromLedger, gap.ToLedger)
+		gaps = append(gaps, *gap)
+		startLedger = clamped
+		if err := store.Save(ctx, state.State{
+			Network:         cfg.Network.Passphrase,
+			LastLedgerSeq:   startLedger - 1,
+			EscrowContracts: reg.Snapshot(),
+			Gaps:            gaps,
+		}); err != nil {
+			return fmt.Errorf("persisting clamp gap: %w", err)
+		}
+	}
+
+	// A bounded backfill whose entire range fell out of retention cannot
+	// run at all — say so instead of letting PrepareRange fail cryptically.
+	if endLedger != 0 && startLedger > endLedger {
+		return fmt.Errorf("backfill range is unservable: clamped start %d exceeds INDEXER_END_LEDGER %d (range fell out of RPC retention) — use an archive RPC for this range", startLedger, endLedger)
+	}
+
+	if err := prepareBackendRange(ctx, backend, startLedger, endLedger); err != nil {
+		return fmt.Errorf("preparing backend range: %w", err)
+	}
+
 	// State detector: fetches the current DataKey::Escrow entry of each
 	// escrow that had activity in a ledger via getLedgerEntries — the
 	// canonical Soroban way to read contract state.
@@ -191,6 +233,15 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 	}()
 
 	ledgerIndexer := indexer.NewIndexer(reg)
+
+	// Progress tracker + health server. The tracker always exists (the
+	// loop reports to it unconditionally — no nil checks in the hot
+	// path); the HTTP server only binds when enabled. Its lifetime is
+	// tied to ctx, same as the loop it observes.
+	tracker := health.NewTracker(cfg.Network.Name)
+	if cfg.Health.Enabled {
+		go health.Serve(ctx, fmt.Sprintf(":%d", cfg.Health.Port), tracker)
+	}
 
 	currentLedger := startLedger
 	log.Ctx(ctx).Infof("Starting ingestion loop from ledger %d (end=%d)", startLedger, endLedger)
@@ -239,6 +290,7 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 			Network:         cfg.Network.Passphrase,
 			LastLedgerSeq:   currentLedger,
 			EscrowContracts: reg.Snapshot(),
+			Gaps:            gaps,
 		}); err != nil {
 			return fmt.Errorf("saving state at ledger %d: %w", currentLedger, err)
 		}
@@ -249,6 +301,16 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 		// a growing age means we are falling behind (or catching up).
 		log.Ctx(ctx).Infof("Processed ledger %d in %v (age %s) — known_escrows=%d escrow_events=%d state_changes=%d",
 			currentLedger, time.Since(started), time.Since(ledgerClosedAt).Round(100*time.Millisecond), reg.Size(), len(facts), len(states))
+
+		tracker.RecordLedger(health.Progress{
+			LedgerSeq:      currentLedger,
+			LedgerClosedAt: ledgerClosedAt,
+			Duration:       time.Since(started),
+			KnownEscrows:   reg.Size(),
+			Events:         len(facts),
+			StateChanges:   len(states),
+			Gaps:           len(gaps),
+		})
 
 		currentLedger++
 	}
