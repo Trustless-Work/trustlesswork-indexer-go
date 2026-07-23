@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/Trustless-Work/Indexer/internal/config"
@@ -47,6 +49,14 @@ const (
 	initialRetryBackoff = time.Second
 	// maxRetryBackoff caps the per-attempt wait so shutdown stays snappy.
 	maxRetryBackoff = 30 * time.Second
+	// tipWaitInterval is the pause between polls when the RPC rejects a
+	// request for a ledger it has not closed yet (beyond-tip). Kept short:
+	// freshness at the tip is the product requirement.
+	tipWaitInterval = time.Second
+	// tipWaitWarnEvery is how many consecutive beyond-tip waits pass
+	// between warnings. At 1s per wait, 30 waits ≈ 30s of a stalled tip —
+	// worth surfacing, since downstream freshness depends on it.
+	tipWaitWarnEvery = 30
 )
 
 // Ingest is the entry point of the Indexer pipeline. It blocks until ctx
@@ -109,6 +119,19 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 	// state in Soroban).
 	rpc := rpcclient.NewClient(cfg.RPC.URL, &http.Client{Timeout: cfg.RPC.RequestTimeout})
 	defer func() { _ = rpc.Close() }()
+
+	// Fail fast if the RPC serves a different network than configured.
+	// The passphrase feeds transaction hashing in the ledger reader, so a
+	// mismatch would produce silently wrong tx hashes on every ledger —
+	// the worst kind of "works but lies" failure when switching networks.
+	netInfo, err := rpc.GetNetwork(ctx)
+	if err != nil {
+		return fmt.Errorf("verifying RPC network: %w", err)
+	}
+	if netInfo.Passphrase != cfg.Network.Passphrase {
+		return fmt.Errorf("RPC network mismatch: %s serves %q but NETWORK_PASSPHRASE is %q — fix RPC_URL or NETWORK_PASSPHRASE",
+			cfg.RPC.URL, netInfo.Passphrase, cfg.Network.Passphrase)
+	}
 
 	// START_LEDGER unset (0) means "start from the network tip". Resolve it
 	// via a direct RPC call: the RPC rejects a PrepareRange starting at 0,
@@ -220,8 +243,12 @@ func Ingest(ctx context.Context, cfg *config.Config) error {
 			return fmt.Errorf("saving state at ledger %d: %w", currentLedger, err)
 		}
 
-		log.Ctx(ctx).Infof("Processed ledger %d in %v — known_escrows=%d escrow_events=%d state_changes=%d",
-			currentLedger, time.Since(started), reg.Size(), len(facts), len(states))
+		// age is how far behind the chain this ledger's data is by the time
+		// we finished publishing it — the freshness number the API depends
+		// on. At the tip it should sit around one close interval (~5-6s);
+		// a growing age means we are falling behind (or catching up).
+		log.Ctx(ctx).Infof("Processed ledger %d in %v (age %s) — known_escrows=%d escrow_events=%d state_changes=%d",
+			currentLedger, time.Since(started), time.Since(ledgerClosedAt).Round(100*time.Millisecond), reg.Size(), len(facts), len(states))
 
 		currentLedger++
 	}
@@ -305,11 +332,21 @@ func prepareBackendRange(ctx context.Context, backend ledgerbackend.LedgerBacken
 // fetchLedgerWithRetry wraps GetLedger with bounded exponential backoff.
 // It honours ctx cancellation between attempts and gives up after
 // maxLedgerFetchRetries failures.
+//
+// Window errors get special handling because some RPC providers reject a
+// request for the next ledger with a "must be between oldest and latest"
+// error instead of blocking until it closes (observed live on mainnet
+// providers). Beyond-tip is normal tip-following — wait briefly without
+// consuming an attempt. Below-retention is deterministic — no number of
+// retries can fix it, so fail immediately with an actionable message
+// instead of burning ~4 minutes and a Railway restart cycle.
 func fetchLedgerWithRetry(ctx context.Context, backend ledgerbackend.LedgerBackend, ledgerSeq uint32) (xdr.LedgerCloseMeta, error) {
 	backoff := initialRetryBackoff
 	var lastErr error
+	attempt := 1
+	tipWaits := 0
 
-	for attempt := 1; attempt <= maxLedgerFetchRetries; attempt++ {
+	for attempt <= maxLedgerFetchRetries {
 		if err := ctx.Err(); err != nil {
 			return xdr.LedgerCloseMeta{}, err
 		}
@@ -322,6 +359,25 @@ func fetchLedgerWithRetry(ctx context.Context, backend ledgerbackend.LedgerBacke
 		// Context cancellation is not transient — surface immediately.
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return xdr.LedgerCloseMeta{}, err
+		}
+
+		switch class, oldest, latest := classifyWindowError(err, ledgerSeq); class {
+		case windowBeyondTip:
+			tipWaits++
+			if tipWaits%tipWaitWarnEvery == 0 {
+				log.Ctx(ctx).Warnf("Ledger %d still beyond RPC tip (%d) after ~%s — tip may be stalled",
+					ledgerSeq, latest, time.Duration(tipWaits)*tipWaitInterval)
+			}
+			select {
+			case <-ctx.Done():
+				return xdr.LedgerCloseMeta{}, ctx.Err()
+			case <-time.After(tipWaitInterval):
+			}
+			continue
+		case windowBelowRetention:
+			return xdr.LedgerCloseMeta{}, fmt.Errorf(
+				"ledger %d is below the RPC retention window (oldest available: %d): the cursor is out of range and retrying cannot help — reset the state file, adjust INDEXER_START_LEDGER, or backfill via an archive RPC: %w",
+				ledgerSeq, oldest, err)
 		}
 
 		lastErr = err
@@ -340,7 +396,52 @@ func fetchLedgerWithRetry(ctx context.Context, backend ledgerbackend.LedgerBacke
 				backoff = maxRetryBackoff
 			}
 		}
+		attempt++
 	}
 
 	return xdr.LedgerCloseMeta{}, fmt.Errorf("giving up after %d attempts: %w", maxLedgerFetchRetries, lastErr)
+}
+
+// windowErrorClass classifies an RPC "requested ledger outside my window"
+// error relative to the ledger we asked for.
+type windowErrorClass int
+
+const (
+	// windowNone: not a window error (or unparseable) — treat as transient.
+	windowNone windowErrorClass = iota
+	// windowBeyondTip: the ledger has not closed yet on this RPC.
+	windowBeyondTip
+	// windowBelowRetention: the ledger fell out of the RPC's retention.
+	windowBelowRetention
+)
+
+// windowErrRe matches the stellar-rpc window error, e.g.:
+//
+//	[-32600] start ledger (63613791) must be between the oldest ledger: 2
+//	and the latest ledger: 63613790 for this rpc instance
+//
+// The requested sequence is taken from the caller, not the message, so the
+// match tolerates format drift around it.
+var windowErrRe = regexp.MustCompile(`oldest ledger:?\s*(\d+).*?latest ledger:?\s*(\d+)`)
+
+// classifyWindowError inspects err and, when it is a window error, returns
+// where the requested ledger sits relative to the advertised window.
+func classifyWindowError(err error, requested uint32) (windowErrorClass, uint32, uint32) {
+	m := windowErrRe.FindStringSubmatch(err.Error())
+	if m == nil {
+		return windowNone, 0, 0
+	}
+	oldest64, oerr := strconv.ParseUint(m[1], 10, 32)
+	latest64, lerr := strconv.ParseUint(m[2], 10, 32)
+	if oerr != nil || lerr != nil {
+		return windowNone, 0, 0
+	}
+	oldest, latest := uint32(oldest64), uint32(latest64)
+	switch {
+	case requested > latest:
+		return windowBeyondTip, oldest, latest
+	case requested < oldest:
+		return windowBelowRetention, oldest, latest
+	}
+	return windowNone, oldest, latest
 }

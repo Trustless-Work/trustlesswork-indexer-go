@@ -58,6 +58,14 @@ type NetworkConfig struct {
 type RPCConfig struct {
 	URL            string        `env:"URL,required"`
 	RequestTimeout time.Duration `env:"REQUEST_TIMEOUT" envDefault:"30s"`
+
+	// LedgerFetchTimeout bounds a single getLedgers/getHealth request made
+	// by the ledger backend. It is separate from RequestTimeout because a
+	// ledger batch can weigh tens of MB on mainnet (~2.65MB per ledger,
+	// limit=10 ≈ 27MB) while getLedgerEntries/getLatestLedger responses
+	// are tiny. Without an explicit client here the SDK backend has NO
+	// timeout at all and one hung connection stalls the loop forever.
+	LedgerFetchTimeout time.Duration `env:"LEDGER_FETCH_TIMEOUT" envDefault:"120s"`
 }
 
 // IndexerConfig tunes the ledger ingestion loop.

@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"fmt"
+	"net/http"
 
 	"github.com/Trustless-Work/Indexer/internal/config"
 	"github.com/stellar/go-stellar-sdk/ingest/ledgerbackend"
@@ -43,7 +44,12 @@ func newRPCLedgerBackend(cfg *config.Config) ledgerbackend.LedgerBackend {
 	backend := ledgerbackend.NewRPCLedgerBackend(ledgerbackend.RPCLedgerBackendOptions{
 		RPCServerURL: cfg.RPC.URL,
 		BufferSize:   uint32(cfg.Indexer.GetLedgersLimit),
+		// Without an explicit client the SDK dials with no timeout and a
+		// hung getLedgers/getHealth blocks GetLedger forever — the process
+		// looks alive while serving nothing.
+		HttpClient: &http.Client{Timeout: cfg.RPC.LedgerFetchTimeout},
 	})
-	log.Infof("Using RPCLedgerBackend (buffer=%d) against %s", cfg.Indexer.GetLedgersLimit, cfg.RPC.URL)
+	log.Infof("Using RPCLedgerBackend (buffer=%d, fetch_timeout=%s) against %s",
+		cfg.Indexer.GetLedgersLimit, cfg.RPC.LedgerFetchTimeout, cfg.RPC.URL)
 	return backend
 }

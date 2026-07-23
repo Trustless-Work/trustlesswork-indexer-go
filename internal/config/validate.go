@@ -60,9 +60,21 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("NETWORK_NAME=testnet but RPC_URL appears to point to mainnet (%q)", c.RPC.URL))
 	}
 
+	// --- RPC timeouts ---
+	if c.RPC.RequestTimeout <= 0 {
+		errs = append(errs, fmt.Errorf("RPC_REQUEST_TIMEOUT must be positive (got %s)", c.RPC.RequestTimeout))
+	}
+	if c.RPC.LedgerFetchTimeout <= 0 {
+		errs = append(errs, fmt.Errorf("RPC_LEDGER_FETCH_TIMEOUT must be positive (got %s)", c.RPC.LedgerFetchTimeout))
+	}
+
 	// --- Indexer ranges ---
-	if c.Indexer.GetLedgersLimit <= 0 {
-		errs = append(errs, fmt.Errorf("INDEXER_GET_LEDGERS_LIMIT must be positive (got %d)", c.Indexer.GetLedgersLimit))
+	// 200 is the hard server-side cap of getLedgers on stellar-rpc; a
+	// larger value fails at runtime with a provider error instead of at
+	// boot. On mainnet keep this LOW (~10): each ledger weighs ~2.65MB,
+	// so limit=100 would request ~265MB in a single response.
+	if c.Indexer.GetLedgersLimit <= 0 || c.Indexer.GetLedgersLimit > 200 {
+		errs = append(errs, fmt.Errorf("INDEXER_GET_LEDGERS_LIMIT must be in [1, 200] (stellar-rpc getLedgers cap; got %d)", c.Indexer.GetLedgersLimit))
 	}
 	if c.Indexer.Workers < 0 {
 		errs = append(errs, fmt.Errorf("INDEXER_WORKERS must be >= 0 (0 means auto; got %d)", c.Indexer.Workers))
