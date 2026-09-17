@@ -99,7 +99,8 @@ for every variable.** The ones you will touch most:
 | `NETWORK_NAME` / `NETWORK_PASSPHRASE` | testnet | Target network; every endpoint is verified against the passphrase |
 | `ESCROW_APPROVED_WASM_HASHES` | *(empty)* | Code hashes that identify TW escrow contracts |
 | `SINK_TYPE` | `noop` | `noop` (dev) or `rabbitmq` (production) |
-| `RABBITMQ_URL` | — | AMQP connection string (required when `SINK_TYPE=rabbitmq`) |
+| `RABBITMQ_URL` | — | AMQP connection string (required when `SINK_TYPE=rabbitmq`); use `amqps://` for TLS when the broker exposes it |
+| `ENVELOPE_HMAC_KEY` | *(empty)* | Shared key for the `x-tw-sig` signature on every published message; must equal the core API's. Empty publishes unsigned (warned at boot) |
 | `STATE_PATH` | `./indexer.state.json` | Durable cursor + watchlist + gap record |
 | `INDEXER_START_LEDGER` | `0` (= tip) | First boot only; afterwards the state file is the source of truth |
 | `HEALTH_HEARTBEAT_URL` | *(empty)* | Dead-man's switch ping; the monitor alerts on silence |

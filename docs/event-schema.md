@@ -49,6 +49,14 @@ Trustless Work NestJS API — rely on to build their views.
 - **Publisher confirms**: enabled. The Indexer advances its cursor only
   after a positive broker ack ⇒ **at-least-once** delivery. Consumers
   MUST be idempotent on `message_id`.
+- **Signature**: every published message (all `type`s, replays included)
+  carries an AMQP header `x-tw-sig`: lowercase hex HMAC-SHA256 of the
+  **exact body bytes** as published, keyed with the raw string value of
+  `ENVELOPE_HMAC_KEY` (shared with the consumer; no hex/base64 decoding
+  on either side). Transport metadata only — the envelope JSON and its
+  `schema_version` are unaffected. The header is absent when the Indexer
+  has no key configured; the consumer decides per its verification mode
+  (off / log / enforce) whether a missing or invalid signature is fatal.
 
 ## Envelope: common header
 

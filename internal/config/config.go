@@ -47,6 +47,16 @@ type Config struct {
 	// private network, not a substitute for it.
 	AdminToken string `env:"ADMIN_TOKEN" secret:"true"`
 
+	// EnvelopeHMACKey is the key shared with the core API for signing
+	// published envelopes (HMAC-SHA256 over the exact body bytes, sent
+	// as the `x-tw-sig` AMQP header). The name and the raw-string key
+	// semantics are the consumer's contract — the core reads the SAME
+	// env var and feeds the string to its HMAC as-is, so no hex/base64
+	// decoding may ever be applied here. Empty disables signing (the
+	// consumer's rollout modes tolerate a missing header until it
+	// switches to enforce).
+	EnvelopeHMACKey string `env:"ENVELOPE_HMAC_KEY" secret:"true"`
+
 	// Replay marks a one-shot `indexer replay` run (set by the CLI, not
 	// by env): bounded range, nothing persisted (the live indexer keeps
 	// its cursor and flock), watchlist read point-in-time, no command

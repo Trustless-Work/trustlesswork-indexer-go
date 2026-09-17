@@ -18,6 +18,9 @@ package rabbitmq
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -44,6 +47,24 @@ const confirmWarnEvery = 30 * time.Second
 // topology, which is fatal here), so a small buffer is plenty; what
 // matters is that it is never zero-slack.
 const returnsBuffer = 8
+
+// signatureHeader carries the envelope signature as transport metadata.
+// The name is the consumer's contract (core-api `SIGNATURE_HEADER`);
+// keeping the signature OUT of the envelope JSON is deliberate — the
+// body stays byte-for-byte what schema 1.1 describes, so there is no
+// canonicalization to get wrong and unsigned pre-rollout messages stay
+// redriveable.
+const signatureHeader = "x-tw-sig"
+
+// signBody returns the lowercase hex HMAC-SHA256 of body under key. It
+// must be fed the EXACT bytes handed to the broker — the consumer
+// verifies over the raw delivery body, so signing a re-marshal (even a
+// semantically equal one) would fail verification.
+func signBody(body, key []byte) string {
+	mac := hmac.New(sha256.New, key)
+	mac.Write(body)
+	return hex.EncodeToString(mac.Sum(nil))
+}
 
 // confirmation is one publish's own receipt, replacing the positional
 // "read the next confirmation off a shared channel" that lost data when
@@ -207,16 +228,21 @@ func (s *Sink) Publish(ctx context.Context, env events.Envelope) error {
 		return fmt.Errorf("marshaling envelope %s: %w", env.MessageID, err)
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	confirm, err := s.ch.publish(ctx, env.RoutingKey(), amqp.Publishing{
+	msg := amqp.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp.Persistent,
 		MessageId:    env.MessageID,
 		Timestamp:    env.PublishedAt,
 		Body:         body,
-	})
+	}
+	if s.cfg.SignatureKey != "" {
+		msg.Headers = amqp.Table{signatureHeader: signBody(body, []byte(s.cfg.SignatureKey))}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	confirm, err := s.ch.publish(ctx, env.RoutingKey(), msg)
 	if err != nil {
 		return fmt.Errorf("%w: publishing %s: %v", sink.ErrSinkUnavailable, env.MessageID, err)
 	}
