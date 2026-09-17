@@ -1,8 +1,10 @@
 package rabbitmq
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -39,8 +41,10 @@ func (f *fakeConfirmation) resolve(ack bool) {
 // so a test can decide independently how each message is answered.
 type fakeChannel struct {
 	answers  []*fakeConfirmation
-	sent     []string // routing keys, in publish order
-	messages []string // MessageId, in publish order
+	sent     []string     // routing keys, in publish order
+	messages []string     // MessageId, in publish order
+	headers  []amqp.Table // AMQP headers, in publish order (nil when unset)
+	bodies   [][]byte     // published bodies, in publish order
 	err      error
 	nilConf  bool // model a channel that is not in confirm mode
 }
@@ -51,6 +55,8 @@ func (c *fakeChannel) publish(_ context.Context, routingKey string, msg amqp.Pub
 	}
 	c.sent = append(c.sent, routingKey)
 	c.messages = append(c.messages, msg.MessageId)
+	c.headers = append(c.headers, msg.Headers)
+	c.bodies = append(c.bodies, msg.Body)
 	if c.nilConf {
 		return nil, nil
 	}
@@ -249,6 +255,73 @@ func TestPublish_InvalidEnvelopeNeverReachesTheBroker(t *testing.T) {
 	}
 	if len(ch.sent) != 0 {
 		t.Errorf("a malformed envelope was published: %v", ch.sent)
+	}
+}
+
+// The signature must reproduce the consumer's exactly — these expected
+// digests are computed with core-api's signEnvelope (envelope-signature.ts)
+// over the same key/body pairs its own spec uses. If this test and the
+// core's disagree, the core's wins: it is the verifier.
+func TestSignBody_MatchesTheConsumerVector(t *testing.T) {
+	key := []byte("kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk") // 'k' (0x6b) × 32, the core's test key
+	for _, tc := range []struct {
+		body string
+		want string
+	}{
+		{`{"a":1}`, "1d3154043cab846e480d276b293ac8d8443514ce52ccd43a7c118d42f9bc5b5b"},
+		{`{"type":"state"}`, "35e6131a4b9d32e2683eb00e71bf516a1e0ee4ee210ab7adf581fd3633372748"},
+	} {
+		if got := signBody([]byte(tc.body), key); got != tc.want {
+			t.Errorf("signBody(%s) = %s, want %s", tc.body, got, tc.want)
+		}
+	}
+}
+
+// The header must sign the EXACT bytes the broker receives — a signature
+// over anything else (a re-marshal, the envelope struct) verifies against
+// nothing on the consumer side. And the body itself must stay untouched:
+// the signature is transport metadata, not an envelope field.
+func TestPublish_SignsTheExactPublishedBody(t *testing.T) {
+	c := newConfirmation()
+	c.resolve(true)
+	ch := &fakeChannel{answers: []*fakeConfirmation{c}}
+	s := newSink(ch, nil)
+	s.cfg.SignatureKey = "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk"
+
+	if err := s.Publish(context.Background(), envelope("one")); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	sig, ok := ch.headers[0][signatureHeader].(string)
+	if !ok {
+		t.Fatalf("headers = %v, want a string %s", ch.headers[0], signatureHeader)
+	}
+	if want := signBody(ch.bodies[0], []byte(s.cfg.SignatureKey)); sig != want {
+		t.Errorf("signature = %s, want %s (HMAC of the published body)", sig, want)
+	}
+	if len(sig) != 64 || strings.ToLower(sig) != sig {
+		t.Errorf("signature %q is not 64-char lowercase hex", sig)
+	}
+	if bytes.Contains(ch.bodies[0], []byte(signatureHeader)) {
+		t.Errorf("the envelope body leaked the signature: %s", ch.bodies[0])
+	}
+}
+
+// No key, no header — not an empty signature, not a signature under an
+// empty key. The consumer distinguishes `missing` (tolerated during
+// rollout) from `invalid` (dropped), and an empty-key signature would
+// land every message in the second bucket.
+func TestPublish_WithoutKeyPublishesNoSignatureHeader(t *testing.T) {
+	c := newConfirmation()
+	c.resolve(true)
+	ch := &fakeChannel{answers: []*fakeConfirmation{c}}
+	s := newSink(ch, nil)
+
+	if err := s.Publish(context.Background(), envelope("one")); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if _, present := ch.headers[0][signatureHeader]; present {
+		t.Errorf("headers = %v, want no %s header without a key", ch.headers[0], signatureHeader)
 	}
 }
 

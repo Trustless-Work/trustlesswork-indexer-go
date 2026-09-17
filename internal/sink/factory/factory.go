@@ -6,6 +6,8 @@ package factory
 import (
 	"fmt"
 
+	"github.com/stellar/go-stellar-sdk/support/log"
+
 	"github.com/Trustless-Work/Indexer/internal/config"
 	"github.com/Trustless-Work/Indexer/internal/sink"
 	"github.com/Trustless-Work/Indexer/internal/sink/noop"
@@ -20,10 +22,19 @@ func New(cfg *config.Config) (sink.Sink, error) {
 	case "noop":
 		return noop.New(), nil
 	case "rabbitmq":
+		if cfg.EnvelopeHMACKey == "" {
+			// Not an error on purpose: the consumer's verification has a
+			// rollout mode that tolerates unsigned messages, and failing
+			// the boot here would take the pipeline down over a header.
+			// But once the core enforces, an unsigned indexer is a dead
+			// pipeline — make the state impossible to miss in the logs.
+			log.Warn("ENVELOPE_HMAC_KEY is not set — publishing UNSIGNED envelopes; the core API will reject them once it enforces signatures")
+		}
 		s, err := rabbitmq.New(rabbitmq.Config{
 			URL:               cfg.RabbitMQ.URL,
 			Exchange:          cfg.RabbitMQ.Exchange,
 			PublisherConfirms: cfg.RabbitMQ.PublisherConfirms,
+			SignatureKey:      cfg.EnvelopeHMACKey,
 		})
 		if err != nil {
 			return nil, err

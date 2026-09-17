@@ -20,6 +20,13 @@ see `docs/event-schema.md`.
   beyond guarding a pre-existing test clock against the race detector.
 
 ### Added
+- Envelope signing: every message published to the broker (all types,
+  replays included) now carries an `x-tw-sig` AMQP header — lowercase hex
+  HMAC-SHA256 of the exact published body under the `ENVELOPE_HMAC_KEY`
+  shared with the core API, which verifies it on consumption. Transport
+  metadata only: the envelope JSON and `schema_version` are unchanged, so
+  this needs no consumer migration. With no key configured the indexer
+  publishes unsigned and warns at boot.
 - Prometheus `/metrics` on the health server: a collector over the same
   tracker snapshot that backs `/status` (current ledger, ledger age,
   publish totals, gaps, ready/paused, uptime — all labelled by network)
