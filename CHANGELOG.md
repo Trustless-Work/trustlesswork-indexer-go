@@ -10,6 +10,18 @@ see `docs/event-schema.md`.
 
 ## [Unreleased]
 
+### Fixed
+- Ledger decoding after the Protocol 30 upgrade: `go-stellar-sdk` 0.7.3 →
+  0.8.0. CAP-0088 makes every post-upgrade ledger carry a millisecond
+  close-time `StellarValue` arm that older SDKs cannot decode, so on
+  testnet (upgraded 2026-11-03) ingestion froze at the upgrade ledger,
+  endlessly retrying `'3' is not a valid StellarValueType` across the
+  endpoint pool with the cursor held. The bump restores decoding; the
+  stall itself was correct behavior (no ledger skipped, no gap recorded,
+  catch-up resumes from the held cursor on deploy). Mainnet runs the same
+  binary and would hit the identical freeze at its Protocol 30 vote —
+  deploy there before that happens.
+
 ### Security
 - Secret validation at boot: `ADMIN_TOKEN`, when set, must be at least
   16 characters and `ENVELOPE_HMAC_KEY`, when set, at least 32 bytes —
