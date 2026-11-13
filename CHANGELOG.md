@@ -10,6 +10,14 @@ see `docs/event-schema.md`.
 
 ## [Unreleased]
 
+### Changed
+- README rewritten as a self-contained operator guide for running your
+  own Indexer: architecture diagram, Docker quick start, full
+  configuration reference (every variable, including the ones
+  `.env.example` omits), approved WASM hashes, consumer bindings with an
+  envelope example, admin surface table, production deployment checklist
+  and a troubleshooting section.
+
 ### Fixed
 - Ledger decoding after the Protocol 30 upgrade: `go-stellar-sdk` 0.7.3 →
   0.8.0. CAP-0088 makes every post-upgrade ledger carry a millisecond
