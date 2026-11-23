@@ -112,3 +112,69 @@ func TestValidate_controlRejectsInvertedRange(t *testing.T) {
 		t.Fatal("inverted gap range must not validate")
 	}
 }
+
+func sampleWithdrawal() processors.EscrowEvent {
+	ev := sampleEvent()
+	ev.Type = processors.EscrowEventTypeWithdrawal
+	ev.EventKind = "token_transfer"
+	return ev
+}
+
+func TestSchemaVersion(t *testing.T) {
+	if CurrentSchemaVersion != "1.3" {
+		t.Errorf("CurrentSchemaVersion = %q, want 1.3", CurrentSchemaVersion)
+	}
+}
+
+func TestFromEscrowEvent_Withdrawal(t *testing.T) {
+	env := FromEscrowEvent("testnet", sampleWithdrawal())
+
+	if env.Type != "withdrawal" {
+		t.Errorf("type = %q, want withdrawal", env.Type)
+	}
+	if env.ContractID != "CESCROW" || env.EventKind != "token_transfer" ||
+		env.TxHash != "abc" || env.TxIndex != 7 || env.EventIndex != 3 ||
+		env.LedgerSeq != 100 || env.RawXDR != "AAAA" {
+		t.Errorf("withdrawal envelope fields not mapped like a deposit: %+v", env)
+	}
+	if env.MessageID != "abc:3:withdrawal" {
+		t.Errorf("message_id = %q, want abc:3:withdrawal", env.MessageID)
+	}
+	if got, want := env.RoutingKey(), "stellar.testnet.escrow.withdrawal.token_transfer"; got != want {
+		t.Errorf("RoutingKey() = %q, want %q", got, want)
+	}
+	if err := env.Validate(); err != nil {
+		t.Errorf("a fully-mapped withdrawal should be valid, got %v", err)
+	}
+}
+
+func TestMessageIDs_DepositAndEventUnchanged(t *testing.T) {
+	if got := FromEscrowEvent("testnet", sampleEvent()).MessageID; got != "abc:3" {
+		t.Errorf("event message_id = %q, want abc:3", got)
+	}
+	dep := sampleEvent()
+	dep.Type = processors.EscrowEventTypeDeposit
+	dep.EventKind = "token_transfer"
+	if got := FromEscrowEvent("testnet", dep).MessageID; got != "abc:3" {
+		t.Errorf("deposit message_id = %q, want abc:3", got)
+	}
+	if got := NewWithdrawalMessageID("abc", 3); got != "abc:3:withdrawal" {
+		t.Errorf("NewWithdrawalMessageID = %q, want abc:3:withdrawal", got)
+	}
+}
+
+func TestValidate_WithdrawalRequirements(t *testing.T) {
+	cases := map[string]func(*Envelope){
+		"contract_id": func(e *Envelope) { e.ContractID = "" },
+		"raw_xdr":     func(e *Envelope) { e.RawXDR = "" },
+		"event_kind":  func(e *Envelope) { e.EventKind = "" },
+		"tx_hash":     func(e *Envelope) { e.TxHash = "" },
+	}
+	for field, strip := range cases {
+		env := FromEscrowEvent("testnet", sampleWithdrawal())
+		strip(&env)
+		if err := env.Validate(); !errors.Is(err, ErrEnvelopeInvalid) {
+			t.Errorf("withdrawal without %s should fail with ErrEnvelopeInvalid, got %v", field, err)
+		}
+	}
+}

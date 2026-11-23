@@ -62,7 +62,7 @@ func newTrackerCollector(t *Tracker) *trackerCollector {
 		ledgerAge:     desc("ledger_age_seconds", "Age of the last processed ledger's close time — the freshness number."),
 		sinceLast:     desc("seconds_since_last_ledger", "Seconds since the loop last processed a ledger."),
 		knownEscrows:  desc("known_escrows", "Escrow contracts currently tracked."),
-		eventsTotal:   desc("events_published_total", "Escrow events and deposits published since boot."),
+		eventsTotal:   desc("events_published_total", "Escrow events, deposits and withdrawals published since boot."),
 		statesTotal:   desc("state_changes_published_total", "State snapshots published since boot (activity + sweep + commands)."),
 		gaps:          desc("gaps_recorded", "Ledger ranges knowingly skipped and recorded as gap evidence."),
 		suppressed:    desc("suppressed_removals_total", "Removals withheld because their batch failed the plausibility guard (an RPC answering with an empty result set). Anything above zero warrants looking at the RPC endpoint."),

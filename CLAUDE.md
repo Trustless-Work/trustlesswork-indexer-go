@@ -35,7 +35,7 @@ a failure even if nothing was technically lost. The service must do ONE thing, p
 
 ## Shared contract with core-api
 
-The envelope shape (`schema_version` currently `1.1`), routing keys and the
+The envelope shape (`schema_version` currently `1.3`), routing keys and the
 `stellar.events` exchange are consumed by `trustlesswork-core-api`
 (`src/presentation/ingestion` + `src/application/ingestion`). A change here is a change
 there. `docs/event-schema.md` is the spec and is current.

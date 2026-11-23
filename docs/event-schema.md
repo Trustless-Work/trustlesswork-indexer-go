@@ -4,11 +4,12 @@ This document is the canonical specification of the messages the Indexer
 publishes to RabbitMQ. It is the contract that consumers — primarily the
 Trustless Work NestJS API — rely on to build their views.
 
-> **Status (updated 2026-10-12):** this is the **live** wire contract. The
+> **Status (updated 2026-11-23):** this is the **live** wire contract. The
 > Indexer publishes to RabbitMQ in production (testnet) and the core API
 > consumes these shapes (`src/presentation/ingestion` +
 > `src/application/ingestion` in `trustlesswork-core-api`). Every stream
-> described below — `event`, `deposit`, `state`, `gap` — is implemented,
+> described below — `event`, `deposit`, `withdrawal` (1.3), `state`,
+> `gap` — is implemented,
 > published with per-message publisher confirms and deterministic
 > `message_id`s, and signed with the `x-tw-sig` AMQP header when
 > `ENVELOPE_HMAC_KEY` is configured. A change to this document is a change
@@ -26,9 +27,9 @@ Trustless Work NestJS API — rely on to build their views.
    enumerating event topics, and *not* by a hand-maintained address
    list. Shipping a new contract version is a config change (one hash),
    never a code change.
-3. **One envelope, three fact types.** A single envelope shape carries a
-   `type` discriminator (`event` / `deposit` / `state`). The consumer
-   uses `type` to choose a projection.
+3. **One envelope, four fact types.** A single envelope shape carries a
+   `type` discriminator (`event` / `deposit` / `withdrawal` / `state`).
+   The consumer uses `type` to choose a projection.
 4. **Deterministic identity and order.** Every message has a
    deterministic `message_id` (idempotency) and a total order key
    (`ledger_seq`, `tx_index`, `event_index`).
@@ -64,10 +65,10 @@ Every message, regardless of `type`, carries these fields (snake_case):
 
 | Field | Type | Description |
 |---|---|---|
-| `schema_version` | string | Wire-contract version (today `"1.1"`). Consumers dispatch to version-specific handlers and MUST ignore unknown fields. |
-| `type` | string | Discriminator: `event`, `deposit`, `state`, or `control` (1.1). |
+| `schema_version` | string | Wire-contract version (today `"1.3"`). Consumers dispatch to version-specific handlers and MUST ignore unknown fields. |
+| `type` | string | Discriminator: `event`, `deposit`, `withdrawal` (1.3), `state`, or `control` (1.1). |
 | `network` | string | `testnet` or `mainnet`. |
-| `contract_id` | string | **The TW escrow** this message concerns (`C…` strkey). The uniform key to group "everything for escrow X". For `event` it is the emitter; for `deposit` it is the recipient (`to`); for `state` it is the owner of the `ContractData`. |
+| `contract_id` | string | **The TW escrow** this message concerns (`C…` strkey). The uniform key to group "everything for escrow X". For `event` it is the emitter; for `deposit` it is the recipient (`to`); for `withdrawal` it is the sender (`from`); for `state` it is the owner of the `ContractData`. |
 | `ledger_seq` | uint32 | Ledger sequence the fact occurred in. |
 | `ledger_closed_at` | RFC 3339 | Close time of the ledger (from the chain). Deterministic and replayable. |
 | `tx_hash` | string (hex) | Transaction that produced the fact. |
@@ -78,19 +79,35 @@ Every message, regardless of `type`, carries these fields (snake_case):
 
 ## Type-specific fields
 
-### `type: "event"` and `type: "deposit"`
+### `type: "event"`, `type: "deposit"` and `type: "withdrawal"`
 
 `raw_xdr` is the full `xdr.ContractEvent` (header + body). Extra fields:
 
 | Field | Type | Description |
 |---|---|---|
-| `event_kind` | string | For `event`: the contract's `topic[0]` Symbol (e.g. `tw_fund`). For `deposit`: `token_transfer`. |
+| `event_kind` | string | For `event`: the contract's `topic[0]` Symbol (e.g. `tw_fund`). For `deposit` and `withdrawal`: `token_transfer`. |
 | `event_index` | uint32 | Position of the event within the transaction's full contract-event list (across all operations). Part of the total order key. |
 
 The distinction between `event` and `deposit`: an `event` is emitted by
 the escrow itself (the emitter IS the escrow); a `deposit` is a
 SAC/SEP-41 `transfer` emitted by a **token** contract whose `to` is a
 known escrow. In both cases `contract_id` is normalised to the escrow.
+
+### `type: "withdrawal"` (1.3)
+
+A SAC/SEP-41 `transfer` emitted by a **token** contract whose `from`
+(`topics[1]`) is a known escrow: releases, dispute-resolution
+distributions and `withdraw_remaining_funds` all move tokens out this
+way. `contract_id` is the escrow (the transfer's `from`); the required
+fields and the `raw_xdr` payload are identical to `deposit`. Like a
+deposit, the Indexer reads only the topic addresses for identity and
+never decodes the amount.
+
+One physical transfer between two registered escrows (or from an escrow
+to itself) yields BOTH a `deposit` and a `withdrawal`, in that order,
+with the same `event_index` — hence the distinct `message_id` suffix
+below. An event emitted by an escrow itself is always exactly one
+`event` fact, never a deposit or withdrawal.
 
 ### `type: "state"`
 
@@ -153,6 +170,7 @@ should alert.
 |---|---|---|
 | `event` | `{tx_hash}:{event_index}` | Unique per physical event. Insert-once into the history table. |
 | `deposit` | `{tx_hash}:{event_index}` | Same as `event`. |
+| `withdrawal` | `{tx_hash}:{event_index}:withdrawal` | Same as `event`; the suffix keeps it distinct from a `deposit` produced by the same physical transfer (the sink matches broker returns by message id). |
 | `state` | `{contract_id}:{ledger_seq}` | "State of escrow X at ledger N." Upsert; keep the row with the highest `ledger_seq`. |
 
 ## Ordering
@@ -174,6 +192,7 @@ stellar.mainnet.escrow.event.tw_init
 stellar.mainnet.escrow.event.tw_fund
 stellar.mainnet.escrow.event.tw_release
 stellar.mainnet.escrow.deposit.token_transfer
+stellar.mainnet.escrow.withdrawal.token_transfer
 stellar.mainnet.escrow.state.updated
 stellar.mainnet.escrow.state.removed
 stellar.mainnet.escrow.control.gap_detected
@@ -187,6 +206,7 @@ Binding examples:
 | Only lifecycle events (history) | `stellar.*.escrow.event.#` |
 | Only state snapshots | `stellar.*.escrow.state.#` |
 | Only deposits | `stellar.*.escrow.deposit.#` |
+| Only withdrawals | `stellar.*.escrow.withdrawal.#` |
 | One specific kind | `stellar.mainnet.escrow.event.tw_fund` |
 
 **Extensibility:** because escrows are identified by WASM hash and the
@@ -221,7 +241,18 @@ receive it with no Indexer change. New event kinds are therefore an
   "raw_xdr": "AAAA..."
 }
 
-// 3) State snapshot (ContractData changed)
+// 3) Withdrawal (SAC transfer out of the escrow)
+{
+  "schema_version": "1.3", "type": "withdrawal", "network": "testnet",
+  "contract_id": "CESCROW...", "ledger_seq": 58762540,
+  "ledger_closed_at": "2026-05-21T18:06:01Z",
+  "tx_hash": "e5f6", "tx_index": 1,
+  "event_kind": "token_transfer", "event_index": 2,
+  "message_id": "e5f6:2:withdrawal", "published_at": "2026-05-21T18:06:02Z",
+  "raw_xdr": "AAAA..."
+}
+
+// 4) State snapshot (ContractData changed)
 {
   "schema_version": "1.1", "type": "state", "network": "testnet",
   "contract_id": "CESCROW...", "ledger_seq": 58762530,
@@ -238,7 +269,7 @@ receive it with no Indexer change. New event kinds are therefore an
 
 From this single stream the consumer materialises two views:
 
-- **History** (`type` in `event`, `deposit`): append-only. A unique
+- **History** (`type` in `event`, `deposit`, `withdrawal`): append-only. A unique
   index on `message_id` + `INSERT ... ON CONFLICT DO NOTHING`. Order by
   `(ledger_seq, tx_index, event_index)`.
 - **State** (`type: state`): upsert keyed by `contract_id`, keeping the
@@ -251,7 +282,7 @@ between broker-ack and cursor-save.
 
 ## Decoding `raw_xdr`
 
-- **`event` / `deposit`** → `xdr.ContractEvent`:
+- **`event` / `deposit` / `withdrawal`** → `xdr.ContractEvent`:
   - Go: `xdr.SafeUnmarshalBase64(env.RawXDR, &ev)`
   - TS: `StellarSdk.xdr.ContractEvent.fromXDR(env.raw_xdr, "base64")`
 - **`state`** → `xdr.LedgerEntry` (a `ContractData` entry):
@@ -269,6 +300,15 @@ between broker-ack and cursor-save.
   field's type or semantics. During migration the Indexer publishes in
   parallel to a versioned routing-key space until consumers cut over;
   the plan is coordinated via the CHANGELOG.
+
+Version history:
+
+- **1.1** — state `removed` and the `control` type (`gap_detected`).
+- **1.2** — not used by the Indexer: core-api names its consumer-side
+  provenance labels (`source`, `api_version`, set by the backfill
+  publisher) "schema 1.2".
+- **1.3** — adds the `withdrawal` type (additive). Deploy the consumer
+  first: an older consumer dead-letters an unknown `type` as malformed.
 
 ## Intentionally NOT in the envelope
 

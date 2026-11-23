@@ -10,6 +10,17 @@ see `docs/event-schema.md`.
 
 ## [Unreleased]
 
+### Added
+- Envelope schema 1.3 (additive): a new fact type `withdrawal` for every
+  SAC/SEP-41 `transfer` whose `from` is a registered escrow, routed as
+  `stellar.<network>.escrow.withdrawal.token_transfer` with message id
+  `{tx_hash}:{event_index}:withdrawal`. Same fields and `raw_xdr` payload
+  as `deposit`; a transfer between two registered escrows yields both a
+  deposit and a withdrawal. `event`, `deposit`, `state` and `control`
+  envelopes are unchanged. Deploy the consumer first: an older core-api
+  dead-letters the unknown type as malformed. Version 1.2 is skipped (it
+  names core-api's consumer-side provenance labels).
+
 ### Changed
 - README rewritten as a self-contained operator guide for running your
   own Indexer: architecture diagram, Docker quick start, full

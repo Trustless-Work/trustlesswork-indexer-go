@@ -5,7 +5,7 @@
 Blockchain indexer for [Trustless Work](https://www.trustlesswork.com) escrows on the
 [Stellar](https://stellar.org) network. It follows the ledger stream in real time,
 detects every on-chain fact that concerns a Trustless Work escrow contract —
-lifecycle events, token deposits, state changes — and publishes them as versioned
+lifecycle events, token deposits and withdrawals, state changes — and publishes them as versioned
 JSON envelopes to RabbitMQ for any consumer to project into its own read model.
 
 Built to run unattended: multi-RPC failover with chain-continuity checks, a durable
@@ -70,6 +70,7 @@ A single envelope shape with a `type` discriminator, one stream per network:
 |---|---|---|
 | `event` | The escrow itself emitted a contract event (`tw_init`, `tw_fund`, `tw_release`, …) | `stellar.testnet.escrow.event.tw_fund` |
 | `deposit` | A SAC/SEP-41 token `transfer` whose recipient is a known escrow | `stellar.testnet.escrow.deposit.token_transfer` |
+| `withdrawal` | A SAC/SEP-41 token `transfer` whose sender is a known escrow (schema 1.3) | `stellar.testnet.escrow.withdrawal.token_transfer` |
 | `state` | The escrow's `ContractData` entry was created / updated / removed | `stellar.testnet.escrow.state.updated` |
 | `control` | A fact about the pipeline itself — today `gap_detected` (a ledger range the RPCs could not serve) | `stellar.testnet.escrow.control.gap_detected` |
 
@@ -270,13 +271,14 @@ dedupe on `message_id`.
 | Only lifecycle events (history) | `stellar.*.escrow.event.#` |
 | Only state snapshots | `stellar.*.escrow.state.#` |
 | Only deposits | `stellar.*.escrow.deposit.#` |
+| Only withdrawals | `stellar.*.escrow.withdrawal.#` |
 | One specific kind | `stellar.mainnet.escrow.event.tw_fund` |
 
 A lifecycle event envelope looks like this:
 
 ```jsonc
 {
-  "schema_version": "1.1",
+  "schema_version": "1.3",
   "type": "event",
   "network": "testnet",
   "contract_id": "CESCROW...",          // the escrow this fact concerns
@@ -297,7 +299,7 @@ Consumer rules (the contract in one paragraph): be **idempotent** on `message_id
 upsert state keeping the highest `ledger_seq`, ignore unknown fields and unknown
 kinds (additive changes don't bump the version), and verify the `x-tw-sig` HMAC
 header when you share a key with the Indexer. Decode `raw_xdr` with the Stellar SDK
-(`xdr.ContractEvent` for `event`/`deposit`, `xdr.LedgerEntry` for `state`).
+(`xdr.ContractEvent` for `event`/`deposit`/`withdrawal`, `xdr.LedgerEntry` for `state`).
 
 Everything above, in full detail: [docs/event-schema.md](docs/event-schema.md).
 
@@ -347,7 +349,7 @@ Background and rationale: [docs/control-plane.md](docs/control-plane.md).
 bin/ingest replay --from 58760000 --to 58770000
 ```
 
-Re-publishes the events and deposits of a bounded range — e.g. to backfill a
+Re-publishes the events, deposits and withdrawals of a bounded range — e.g. to backfill a
 recorded gap or an escrow seeded after its history happened. Safe to run **next
 to** the live indexer: it persists nothing, takes no lock, consumes no commands and
 never pings the heartbeat. It borrows the live watchlist as a point-in-time copy

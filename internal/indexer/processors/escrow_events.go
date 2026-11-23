@@ -14,7 +14,7 @@ import (
 // transferTopic is the first-topic Symbol of a SAC/SEP-41 transfer event.
 const transferTopic = "transfer"
 
-// EscrowEventType discriminates the two fact kinds this detector emits.
+// EscrowEventType discriminates the fact kinds this detector emits.
 type EscrowEventType string
 
 const (
@@ -24,6 +24,9 @@ const (
 	// EscrowEventTypeDeposit is a SAC/SEP-41 transfer whose recipient is
 	// a known escrow (the emitter is the token contract).
 	EscrowEventTypeDeposit EscrowEventType = "deposit"
+	// EscrowEventTypeWithdrawal is a SAC/SEP-41 transfer whose sender is a
+	// known escrow (the emitter is the token contract).
+	EscrowEventTypeWithdrawal EscrowEventType = "withdrawal"
 )
 
 // EscrowEvent is a detected fact about one Soroban contract event of
@@ -33,7 +36,7 @@ const (
 type EscrowEvent struct {
 	Type           EscrowEventType
 	EscrowID       string // the escrow this fact concerns (C... strkey)
-	EventKind      string // topic[0] for events; "token_transfer" for deposits
+	EventKind      string // topic[0] for events; "token_transfer" for deposits/withdrawals
 	EventIndex     uint32 // position within the transaction's event list
 	TxHash         string
 	TxIndex        uint32 // application order within the ledger
@@ -47,7 +50,9 @@ type EscrowEvent struct {
 //
 //   - any event emitted by a registered escrow (forwarded regardless of
 //     topic — new event kinds need no code change);
-//   - any SAC transfer whose `to` address is a registered escrow.
+//   - any SAC transfer whose `to` address is a registered escrow (deposit);
+//   - any SAC transfer whose `from` address is a registered escrow
+//     (withdrawal).
 //
 // It does NOT enumerate TW topics and does NOT decode contract-specific
 // payloads; it filters by identity and forwards raw XDR.
@@ -66,7 +71,10 @@ func (d *EscrowEventDetector) Name() string { return "escrow_events" }
 // DetectFromTransaction returns the escrow-related events found in tx, in
 // the order encountered. EventIndex is a per-transaction running counter
 // across all operations' events, matching how Soroban consumers number
-// events within a transaction.
+// events within a transaction. One physical event may yield two facts (a
+// transfer between two registered escrows, or from an escrow to itself):
+// both carry the same EventIndex, and the counter still advances once per
+// physical event.
 func (d *EscrowEventDetector) DetectFromTransaction(tx ingest.LedgerTransaction) ([]EscrowEvent, error) {
 	ledgerSeq := tx.Ledger.LedgerSequence()
 	closedAt := time.Unix(tx.Ledger.LedgerCloseTime(), 0).UTC()
@@ -83,19 +91,21 @@ func (d *EscrowEventDetector) DetectFromTransaction(tx ingest.LedgerTransaction)
 			return out, fmt.Errorf("getting contract events for op=%d: %w", opIdx, err)
 		}
 		for _, ev := range events {
-			fact, ok := d.classify(ev)
-			if ok {
+			facts := d.classify(ev)
+			if len(facts) > 0 {
 				raw, err := encodeEventXDR(ev)
 				if err != nil {
 					return out, fmt.Errorf("encoding event idx=%d: %w", eventIdx, err)
 				}
-				fact.EventIndex = eventIdx
-				fact.TxHash = txHash
-				fact.TxIndex = txIndex
-				fact.LedgerSeq = ledgerSeq
-				fact.LedgerClosedAt = closedAt
-				fact.RawXDR = raw
-				out = append(out, fact)
+				for _, fact := range facts {
+					fact.EventIndex = eventIdx
+					fact.TxHash = txHash
+					fact.TxIndex = txIndex
+					fact.LedgerSeq = ledgerSeq
+					fact.LedgerClosedAt = closedAt
+					fact.RawXDR = raw
+					out = append(out, fact)
+				}
 			}
 			eventIdx++
 		}
@@ -103,34 +113,50 @@ func (d *EscrowEventDetector) DetectFromTransaction(tx ingest.LedgerTransaction)
 	return out, nil
 }
 
-// classify decides whether ev concerns a known escrow and, if so, how.
+// classify decides whether ev concerns a known escrow and, if so, how,
+// returning one fact per escrow-side of the event (none when irrelevant).
 // It never errors: a malformed or irrelevant event is simply not of
 // interest.
-func (d *EscrowEventDetector) classify(ev xdr.ContractEvent) (EscrowEvent, bool) {
+func (d *EscrowEventDetector) classify(ev xdr.ContractEvent) []EscrowEvent {
 	// 1) Event emitted by an escrow itself → forward it whatever the kind.
 	if emitter, ok := contractIDFromEvent(ev); ok && d.registry.IsEscrow(emitter) {
 		kind, _ := firstTopicSymbol(ev) // may be empty; still forwarded
-		return EscrowEvent{Type: EscrowEventTypeEvent, EscrowID: emitter, EventKind: kind}, true
+		return []EscrowEvent{{Type: EscrowEventTypeEvent, EscrowID: emitter, EventKind: kind}}
 	}
 
-	// 2) SAC transfer whose recipient is a known escrow → a deposit.
+	// 2) SAC transfer touching a known escrow on either side.
 	// TW-03 origin-side: the attributed escrow is BY CONSTRUCTION the
-	// event's `to` (topics[2]) — the consumer re-verifies the same
-	// invariant against the raw XDR and DLQs any mismatch, so both ends
-	// of the pipe enforce it independently. A well-formed SEP-41/SAC
-	// transfer also carries an Address in `from` (topics[1]); an event
-	// that merely spells "transfer" but lacks it is not a transfer and
-	// is not forwarded. What the origin CANNOT know is whether the
-	// emitting contract is the escrow's actual trustline token — that
-	// check needs per-escrow trustline knowledge and belongs to the
-	// consumer.
-	if sym, ok := firstTopicSymbol(ev); ok && sym == transferTopic && transferHasFromAddress(ev) {
-		if to, ok := transferToAddress(ev); ok && d.registry.IsEscrow(to) {
-			return EscrowEvent{Type: EscrowEventTypeDeposit, EscrowID: to, EventKind: "token_transfer"}, true
-		}
+	// event's `to` (topics[2]) for a deposit and its `from` (topics[1])
+	// for a withdrawal — the consumer re-verifies the same invariant
+	// against the raw XDR and DLQs any mismatch, so both ends of the pipe
+	// enforce it independently. A well-formed SEP-41/SAC transfer carries
+	// an Address in both `from` and `to`; an event that merely spells
+	// "transfer" but lacks either is not a transfer and is not forwarded.
+	// What the origin CANNOT know is whether the emitting contract is the
+	// escrow's actual trustline token — that check needs per-escrow
+	// trustline knowledge and belongs to the consumer. One transfer may
+	// concern two escrows (or the same escrow twice); the deposit comes
+	// first.
+	sym, ok := firstTopicSymbol(ev)
+	if !ok || sym != transferTopic {
+		return nil
 	}
-
-	return EscrowEvent{}, false
+	from, ok := transferFromAddress(ev)
+	if !ok {
+		return nil
+	}
+	to, ok := transferToAddress(ev)
+	if !ok {
+		return nil
+	}
+	var out []EscrowEvent
+	if d.registry.IsEscrow(to) {
+		out = append(out, EscrowEvent{Type: EscrowEventTypeDeposit, EscrowID: to, EventKind: "token_transfer"})
+	}
+	if d.registry.IsEscrow(from) {
+		out = append(out, EscrowEvent{Type: EscrowEventTypeWithdrawal, EscrowID: from, EventKind: "token_transfer"})
+	}
+	return out
 }
 
 // contractIDFromEvent returns the emitter contract as a "C..." strkey,
@@ -175,19 +201,19 @@ func transferToAddress(ev xdr.ContractEvent) (string, bool) {
 	return addressFromScVal(topics[2])
 }
 
-// transferHasFromAddress reports whether topics[1] decodes as an Address —
-// mandatory in a real SEP-41/SAC transfer, absent in fabricated
+// transferFromAddress extracts the `from` address (topics[1]) of a
+// SAC/SEP-41 transfer event: topics = [Symbol("transfer"), from, to]. The
+// Address is mandatory in a real transfer and absent in fabricated
 // transfer-shaped events (TW-03 origin-side shape check).
-func transferHasFromAddress(ev xdr.ContractEvent) bool {
+func transferFromAddress(ev xdr.ContractEvent) (string, bool) {
 	if ev.Body.V != 0 || ev.Body.V0 == nil {
-		return false
+		return "", false
 	}
 	topics := ev.Body.V0.Topics
 	if len(topics) < 3 {
-		return false
+		return "", false
 	}
-	_, ok := addressFromScVal(topics[1])
-	return ok
+	return addressFromScVal(topics[1])
 }
 
 // addressFromScVal decodes an ScVal carrying an ScAddress into its strkey

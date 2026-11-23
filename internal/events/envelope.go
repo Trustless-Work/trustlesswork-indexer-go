@@ -19,7 +19,16 @@ import (
 // payload), and a new type "control" reports pipeline-level facts, today
 // only control_kind "gap_detected" (a skipped ledger range). The consumer
 // accepts any 1.x; deploy the consumer BEFORE an indexer that emits these.
-const CurrentSchemaVersion = "1.1"
+//
+// 1.2 is not used here: core-api already names its consumer-side
+// provenance labels (`source`, `api_version`) "schema 1.2".
+//
+// 1.3 (additive): a new type "withdrawal" reports every SAC/SEP-41
+// transfer whose `from` is a registered escrow, same fields as "deposit"
+// and message id "{tx_hash}:{event_index}:withdrawal". The consumer must
+// be deployed BEFORE an indexer that emits it: an older consumer
+// dead-letters an unknown type as malformed.
+const CurrentSchemaVersion = "1.3"
 
 // ControlKindGapDetected marks a control envelope reporting a ledger
 // range the indexer knowingly skipped (e.g. clamped past RPC retention).
@@ -75,9 +84,22 @@ func NewMessageID(txHash string, eventIndex uint32) string {
 	return fmt.Sprintf("%s:%d", txHash, eventIndex)
 }
 
+// NewWithdrawalMessageID builds the deterministic idempotency key for a
+// withdrawal envelope: "{tx_hash}:{event_index}:withdrawal". The suffix
+// is required: one transfer between two registered escrows (or from an
+// escrow to itself) yields BOTH a deposit and a withdrawal for the same
+// event, and the sink matches broker returns by message id.
+func NewWithdrawalMessageID(txHash string, eventIndex uint32) string {
+	return fmt.Sprintf("%s:%d:withdrawal", txHash, eventIndex)
+}
+
 // FromEscrowEvent maps a detected fact onto a wire envelope, stamping the
 // schema version, message id and publish time.
 func FromEscrowEvent(network string, ev processors.EscrowEvent) Envelope {
+	messageID := NewMessageID(ev.TxHash, ev.EventIndex)
+	if ev.Type == processors.EscrowEventTypeWithdrawal {
+		messageID = NewWithdrawalMessageID(ev.TxHash, ev.EventIndex)
+	}
 	return Envelope{
 		SchemaVersion:  CurrentSchemaVersion,
 		Type:           string(ev.Type),
@@ -89,7 +111,7 @@ func FromEscrowEvent(network string, ev processors.EscrowEvent) Envelope {
 		TxIndex:        ev.TxIndex,
 		EventKind:      ev.EventKind,
 		EventIndex:     ev.EventIndex,
-		MessageID:      NewMessageID(ev.TxHash, ev.EventIndex),
+		MessageID:      messageID,
 		PublishedAt:    time.Now().UTC(),
 		RawXDR:         ev.RawXDR,
 	}
@@ -149,7 +171,7 @@ func FromGap(network string, fromLedger, toLedger uint32, reason string, detecte
 
 // RoutingKey is the topic-exchange key for this envelope:
 // "stellar.<network>.escrow.<type>.<kind>", where kind is the event kind
-// for event/deposit, the state_change_type for state, and the control
+// for event/deposit/withdrawal, the state_change_type for state, and the control
 // kind for control. Every segment is a single token so AMQP
 // single-segment wildcards work.
 func (e Envelope) RoutingKey() string {
@@ -184,7 +206,7 @@ func (e Envelope) Validate() error {
 
 	// Type-specific fields.
 	switch e.Type {
-	case "event", "deposit":
+	case "event", "deposit", "withdrawal":
 		if e.ContractID == "" {
 			return fmt.Errorf("%w: missing contract_id", ErrEnvelopeInvalid)
 		}

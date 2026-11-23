@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/Trustless-Work/Indexer/internal/indexer/registry"
+	"github.com/stellar/go-stellar-sdk/ingest"
 	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stellar/go-stellar-sdk/xdr"
 )
@@ -69,10 +70,11 @@ func TestClassify_DepositAttributionMatchesTransferTo(t *testing.T) {
 	d := NewEscrowEventDetector(eventsRegistry(t, escrowID))
 	ev := eventWith(token, symVal("transfer"), contractAddrVal(from), contractAddrVal(escrow))
 
-	fact, ok := d.classify(ev)
-	if !ok {
-		t.Fatal("a transfer into a tracked escrow must classify as a deposit")
+	facts := d.classify(ev)
+	if len(facts) != 1 {
+		t.Fatalf("a transfer into a tracked escrow must classify as one deposit, got %+v", facts)
 	}
+	fact := facts[0]
 	if fact.Type != EscrowEventTypeDeposit || fact.EscrowID != escrowID {
 		t.Fatalf("fact = %+v, want deposit attributed to %s", fact, escrowID)
 	}
@@ -93,8 +95,8 @@ func TestClassify_FabricatedTransferWithoutFromAddressIsDropped(t *testing.T) {
 	d := NewEscrowEventDetector(eventsRegistry(t, escrowID))
 	ev := eventWith(scam, symVal("transfer"), symVal("junk"), contractAddrVal(escrow))
 
-	if fact, ok := d.classify(ev); ok {
-		t.Fatalf("transfer-shaped event without a from Address was forwarded: %+v", fact)
+	if facts := d.classify(ev); len(facts) != 0 {
+		t.Fatalf("transfer-shaped event without a from Address was forwarded: %+v", facts)
 	}
 }
 
@@ -106,8 +108,8 @@ func TestClassify_TransferToStrangerIsIgnored(t *testing.T) {
 	d := NewEscrowEventDetector(eventsRegistry(t, contractStrkey(t, contractIDBytes(0x03))))
 	ev := eventWith(token, symVal("transfer"), contractAddrVal(from), contractAddrVal(stranger))
 
-	if fact, ok := d.classify(ev); ok {
-		t.Fatalf("transfer to a stranger was forwarded: %+v", fact)
+	if facts := d.classify(ev); len(facts) != 0 {
+		t.Fatalf("transfer to a stranger was forwarded: %+v", facts)
 	}
 }
 
@@ -118,8 +120,184 @@ func TestClassify_EscrowEmittedEventForwardsAnyKind(t *testing.T) {
 	d := NewEscrowEventDetector(eventsRegistry(t, escrowID))
 	ev := eventWith(escrow, symVal("brand_new_kind"))
 
-	fact, ok := d.classify(ev)
-	if !ok || fact.Type != EscrowEventTypeEvent || fact.EscrowID != escrowID || fact.EventKind != "brand_new_kind" {
-		t.Fatalf("fact = %+v ok=%v, want escrow event with open-ended kind", fact, ok)
+	facts := d.classify(ev)
+	if len(facts) != 1 || facts[0].Type != EscrowEventTypeEvent || facts[0].EscrowID != escrowID || facts[0].EventKind != "brand_new_kind" {
+		t.Fatalf("facts = %+v, want one escrow event with open-ended kind", facts)
+	}
+}
+
+func TestClassify_TransferFromEscrowIsWithdrawal(t *testing.T) {
+	token := contractIDBytes(0x01)
+	escrow := contractIDBytes(0x03)
+	recipient := contractIDBytes(0x04)
+	escrowID := contractStrkey(t, escrow)
+
+	d := NewEscrowEventDetector(eventsRegistry(t, escrowID))
+	ev := eventWith(token, symVal("transfer"), contractAddrVal(escrow), contractAddrVal(recipient))
+
+	facts := d.classify(ev)
+	if len(facts) != 1 {
+		t.Fatalf("a transfer out of a tracked escrow must classify as one withdrawal, got %+v", facts)
+	}
+	fact := facts[0]
+	if fact.Type != EscrowEventTypeWithdrawal || fact.EscrowID != escrowID || fact.EventKind != "token_transfer" {
+		t.Fatalf("fact = %+v, want withdrawal attributed to %s", fact, escrowID)
+	}
+	if from, _ := transferFromAddress(ev); from != fact.EscrowID {
+		t.Fatalf("attribution invariant broken: envelope says %s, raw event says %s", fact.EscrowID, from)
+	}
+}
+
+func TestClassify_EscrowToEscrowYieldsDepositThenWithdrawal(t *testing.T) {
+	token := contractIDBytes(0x01)
+	src := contractIDBytes(0x03)
+	dst := contractIDBytes(0x05)
+	srcID := contractStrkey(t, src)
+	dstID := contractStrkey(t, dst)
+
+	d := NewEscrowEventDetector(eventsRegistry(t, srcID, dstID))
+	ev := eventWith(token, symVal("transfer"), contractAddrVal(src), contractAddrVal(dst))
+
+	facts := d.classify(ev)
+	if len(facts) != 2 {
+		t.Fatalf("escrow → escrow must yield two facts, got %+v", facts)
+	}
+	if facts[0].Type != EscrowEventTypeDeposit || facts[0].EscrowID != dstID {
+		t.Errorf("first fact = %+v, want deposit into %s", facts[0], dstID)
+	}
+	if facts[1].Type != EscrowEventTypeWithdrawal || facts[1].EscrowID != srcID {
+		t.Errorf("second fact = %+v, want withdrawal from %s", facts[1], srcID)
+	}
+}
+
+func TestClassify_EscrowToItselfYieldsTwoFacts(t *testing.T) {
+	token := contractIDBytes(0x01)
+	escrow := contractIDBytes(0x03)
+	escrowID := contractStrkey(t, escrow)
+
+	d := NewEscrowEventDetector(eventsRegistry(t, escrowID))
+	ev := eventWith(token, symVal("transfer"), contractAddrVal(escrow), contractAddrVal(escrow))
+
+	facts := d.classify(ev)
+	if len(facts) != 2 ||
+		facts[0].Type != EscrowEventTypeDeposit || facts[0].EscrowID != escrowID ||
+		facts[1].Type != EscrowEventTypeWithdrawal || facts[1].EscrowID != escrowID {
+		t.Fatalf("facts = %+v, want deposit then withdrawal for %s", facts, escrowID)
+	}
+}
+
+func TestClassify_EscrowEmitterYieldsOnlyEvent(t *testing.T) {
+	// An escrow emitting a transfer-shaped event naming itself is still
+	// exactly one `event` fact — rule 1 wins and returns.
+	escrow := contractIDBytes(0x03)
+	other := contractIDBytes(0x05)
+	escrowID := contractStrkey(t, escrow)
+
+	d := NewEscrowEventDetector(eventsRegistry(t, escrowID, contractStrkey(t, other)))
+	ev := eventWith(escrow, symVal("transfer"), contractAddrVal(escrow), contractAddrVal(other))
+
+	facts := d.classify(ev)
+	if len(facts) != 1 || facts[0].Type != EscrowEventTypeEvent || facts[0].EscrowID != escrowID {
+		t.Fatalf("facts = %+v, want one event fact", facts)
+	}
+}
+
+func TestClassify_TransferWithoutToAddressIsDropped(t *testing.T) {
+	token := contractIDBytes(0x01)
+	escrow := contractIDBytes(0x03)
+	escrowID := contractStrkey(t, escrow)
+
+	d := NewEscrowEventDetector(eventsRegistry(t, escrowID))
+	ev := eventWith(token, symVal("transfer"), contractAddrVal(escrow), symVal("junk"))
+
+	if facts := d.classify(ev); len(facts) != 0 {
+		t.Fatalf("transfer without a to Address was forwarded: %+v", facts)
+	}
+}
+
+func TestClassify_UnrelatedTransferIsIgnored(t *testing.T) {
+	token := contractIDBytes(0x01)
+	a := contractIDBytes(0x0E)
+	b := contractIDBytes(0x0F)
+
+	d := NewEscrowEventDetector(eventsRegistry(t, contractStrkey(t, contractIDBytes(0x03))))
+	ev := eventWith(token, symVal("transfer"), contractAddrVal(a), contractAddrVal(b))
+
+	if facts := d.classify(ev); len(facts) != 0 {
+		t.Fatalf("unrelated transfer was forwarded: %+v", facts)
+	}
+}
+
+// txWithEvents builds a one-operation transaction whose meta carries evs.
+// Each event gets a Void data value so its XDR marshals.
+func txWithEvents(evs ...xdr.ContractEvent) ingest.LedgerTransaction {
+	for _, ev := range evs {
+		ev.Body.V0.Data = xdr.ScVal{Type: xdr.ScValTypeScvVoid}
+	}
+	return ingest.LedgerTransaction{
+		Index: 1,
+		Envelope: xdr.TransactionEnvelope{
+			Type: xdr.EnvelopeTypeEnvelopeTypeTx,
+			V1: &xdr.TransactionV1Envelope{
+				Tx: xdr.Transaction{Operations: []xdr.Operation{{}}},
+			},
+		},
+		UnsafeMeta: xdr.TransactionMeta{
+			V: 4,
+			V4: &xdr.TransactionMetaV4{
+				Operations: []xdr.OperationMetaV2{{Events: evs}},
+			},
+		},
+		Ledger: xdr.LedgerCloseMeta{
+			V: 1,
+			V1: &xdr.LedgerCloseMetaV1{
+				LedgerHeader: xdr.LedgerHeaderHistoryEntry{
+					Header: xdr.LedgerHeader{
+						LedgerSeq: 100,
+						ScpValue:  xdr.StellarValue{CloseTime: 1700000000},
+					},
+				},
+			},
+		},
+	}
+}
+
+func TestDetectFromTransaction_DoubleFactSharesEventIndex(t *testing.T) {
+	token := contractIDBytes(0x01)
+	src := contractIDBytes(0x03)
+	dst := contractIDBytes(0x05)
+	stranger := contractIDBytes(0x0F)
+	srcID := contractStrkey(t, src)
+	dstID := contractStrkey(t, dst)
+
+	d := NewEscrowEventDetector(eventsRegistry(t, srcID, dstID))
+	tx := txWithEvents(
+		// idx 0: escrow → escrow (two facts)
+		eventWith(token, symVal("transfer"), contractAddrVal(src), contractAddrVal(dst)),
+		// idx 1: unrelated
+		eventWith(token, symVal("transfer"), contractAddrVal(stranger), contractAddrVal(stranger)),
+		// idx 2: plain deposit
+		eventWith(token, symVal("transfer"), contractAddrVal(stranger), contractAddrVal(dst)),
+	)
+
+	facts, err := d.DetectFromTransaction(tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(facts) != 3 {
+		t.Fatalf("got %d facts, want 3: %+v", len(facts), facts)
+	}
+	if facts[0].Type != EscrowEventTypeDeposit || facts[1].Type != EscrowEventTypeWithdrawal {
+		t.Fatalf("double fact order = %s, %s; want deposit, withdrawal", facts[0].Type, facts[1].Type)
+	}
+	if facts[0].EventIndex != 0 || facts[1].EventIndex != 0 {
+		t.Errorf("double fact event indexes = %d, %d; want 0, 0", facts[0].EventIndex, facts[1].EventIndex)
+	}
+	if facts[0].RawXDR == "" || facts[0].RawXDR != facts[1].RawXDR {
+		t.Error("both facts of one physical event must carry the same raw XDR")
+	}
+	// The counter advanced once per PHYSICAL event, not per fact.
+	if facts[2].Type != EscrowEventTypeDeposit || facts[2].EventIndex != 2 {
+		t.Errorf("later fact = %+v, want deposit at event index 2", facts[2])
 	}
 }
