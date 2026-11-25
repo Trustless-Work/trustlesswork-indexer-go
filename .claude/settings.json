@@ -22,5 +22,52 @@
       "Read(./indexer.state.json)",
       "Read(./indexer.watchlist.seed.json)"
     ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR\"/.claude/skills/context-sync/scripts/context-sync.sh check-session",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR\"/.claude/skills/context-sync/scripts/context-sync.sh check-prompt",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR\"/.claude/skills/context-sync/scripts/context-sync.sh check-bash",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR\"/.claude/skills/context-sync/scripts/context-sync.sh check-stop",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
   }
 }
