@@ -76,6 +76,26 @@ and declared ceilings — keep it in the same PR as any change to a mechanism it
 - Local `make run` and `make up` both bind :8080 — stop one before the other.
 - Ops procedures (reseed, replay, pause, state reset): `.claude/skills/ops-runbook`.
 
+## Context sync (mandatory after every merge to `main`)
+
+Every merge into `main` must be reconciled into `Trustless-Work/trustlesswork-context`,
+the company context repo, so it always states the current truth of the Indexer.
+
+- The moment you learn a PR was merged into `main` (the user says so, a hook prints
+  `CONTEXT SYNC REQUIRED`, or you see it in `git`/`gh` output), follow
+  `.claude/skills/context-sync/SKILL.md` and finish it in the same turn. Do not ask
+  first and do not leave it for later; it ends with a PR in the context repo, merged
+  by you.
+- What you write there must read as if its maintainers wrote it: edit the section that
+  already owns the topic, keep its vocabulary ("Indexer", "Core API v2", "read model")
+  and its nature (durable interpretation, no status, no tooling notes). The map of
+  destinations and the conventions are in `.claude/skills/context-sync/destinations.md`.
+- It is not optional. The only exits are the two the skill names: a range with nothing
+  to reconcile, recorded with its reason, or the user telling you to skip that one.
+- Hooks in `.claude/settings.json` enforce it for Claude Code (session start, prompts
+  that mention a merge, after `gh pr merge`/`git pull`, and before the turn ends).
+  Agents without hooks follow this section all the same.
+
 ## Workflow
 
 - Every change starts on a new branch from `main` and lands through a GitHub PR + merge.
